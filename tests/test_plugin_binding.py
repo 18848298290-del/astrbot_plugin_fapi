@@ -129,6 +129,10 @@ class FakeEvent:
     def plain_result(text):
         return text
 
+    @staticmethod
+    def image_result(path):
+        return ("image", path)
+
 
 async def collect(async_generator):
     return [item async for item in async_generator]
@@ -339,6 +343,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             object(),
             {"allowed_group_id": "987654321"},
         )
+        self.plugin._slot_animation_enabled = False
+        self.plugin._slot_animation_delay_seconds = 0
         await self.plugin.client.close()
 
     async def asyncTearDown(self):
@@ -1136,6 +1142,33 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls[0]["amount"], Decimal("0.10"))
         self.assertIsNone(games.reserve_calls[0]["credit_user_id"])
         self.assertEqual(games.reserve_calls[0]["credit_units"], 0)
+
+    async def test_slot_animation_precedes_result_when_enabled(self):
+        games = InMemoryGameStore(self.module)
+        self.plugin.bindings = GameBindings({"12345": 11})
+        self.plugin.games = games
+        self.plugin.client = BalanceClient(self.module)
+        self.plugin._slot_animation_enabled = True
+        self.module.roll_success = lambda _rate: False
+
+        replies = await collect(self.plugin.slot_machine(FakeEvent()))
+
+        self.assertEqual(replies[0][0], "image")
+        self.assertEqual(Path(replies[0][1]).name, "slot_machine.gif")
+        self.assertEqual(replies[1], "老虎机未中奖\n本次投入：USD 0.10")
+
+    async def test_slot_skips_animation_when_asset_is_missing(self):
+        games = InMemoryGameStore(self.module)
+        self.plugin.bindings = GameBindings({"12345": 11})
+        self.plugin.games = games
+        self.plugin.client = BalanceClient(self.module)
+        self.plugin._slot_animation_enabled = True
+        self.module._SLOT_ANIMATION_PATH = Path("missing-slot-animation.gif")
+        self.module.roll_success = lambda _rate: False
+
+        replies = await collect(self.plugin.slot_machine(FakeEvent()))
+
+        self.assertEqual(replies, ["老虎机未中奖\n本次投入：USD 0.10"])
 
     async def test_slot_insufficient_balance_never_pays_prize(self):
         games = InMemoryGameStore(self.module)
