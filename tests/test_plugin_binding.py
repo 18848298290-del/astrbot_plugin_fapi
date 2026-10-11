@@ -583,8 +583,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             replies,
             [
                 "用户名：RYAN\n"
-                "余额：$10.00\n"
-                "已使用（近30天）：$1.25\n"
+                "余额：USD 10.00\n"
+                "已使用（近30天）：USD 1.25\n"
                 "并发上限：5"
             ],
         )
@@ -638,8 +638,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             replies,
             [
                 "用户名：RYAN\n"
-                "余额：$10.00\n"
-                "已使用（近30天）：$1.2345\n"
+                "余额：USD 10.00\n"
+                "已使用（近30天）：USD 1.2345\n"
                 "并发上限：5"
             ],
         )
@@ -705,7 +705,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delivered, ["op-checkin"])
         self.assertEqual(
             replies,
-            ["签到成功\n奖励：$0.05\n连续签到：3 天\n累计签到：8 天"],
+            ["签到成功\n奖励：USD 0.05\n连续签到：3 天\n累计签到：8 天"],
         )
 
     async def test_completed_checkin_does_not_credit_again(self):
@@ -837,7 +837,9 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("群红包 #9 已创建", replies[0])
-        self.assertIn("总金额：$1.00", replies[0])
+        self.assertIn("总金额：USD 1.00", replies[0])
+        self.assertIn("领取指令：/fapi 抢红包 9", replies[0])
+        self.assertNotIn("抢红包 领取", replies[0])
 
     async def test_official_group_role_does_not_bypass_astrbot_admin_check(self):
         class Rewards:
@@ -1009,8 +1011,34 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             replies,
-            ["抢到红包 #9\n金额：$0.12\n奖励已加入中转站余额。"],
+            ["抢到红包 #9\n金额：USD 0.12\n奖励已加入中转站余额。"],
         )
+
+    async def test_claim_red_packet_rejects_non_numeric_id_before_storage(self):
+        class Store:
+            async def get_by_qq(_self, _qq_id):
+                raise AssertionError("非法红包编号不得访问绑定数据库")
+
+        self.plugin.bindings = Store()
+
+        replies = await collect(
+            self.plugin.claim_red_packet(FakeEvent(group_id="987654321"), "领取")
+        )
+
+        self.assertEqual(replies, ["红包编号不正确。"])
+
+    async def test_red_packet_status_rejects_non_numeric_id_before_storage(self):
+        class Rewards:
+            async def get_red_packet(_self, **_values):
+                raise AssertionError("非法红包编号不得访问红包数据库")
+
+        self.plugin.rewards = Rewards()
+
+        replies = await collect(
+            self.plugin.red_packet_status(FakeEvent(group_id="987654321"), "领取")
+        )
+
+        self.assertEqual(replies, ["红包编号不正确。"])
 
 
 async def _async_value(value):

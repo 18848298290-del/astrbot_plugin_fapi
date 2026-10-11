@@ -69,7 +69,24 @@ astrbot_fapi_reward_budgets
 
 ## 安装与升级
 
-上传 `astrbot_plugin_fapi.zip`。如果 AstrBot 提示 `目录 astrbot_plugin_fapi 已存在`，请先在插件管理页卸载旧版本，再上传新版；上传安装不会自动覆盖同名目录。
+插件仓库：<https://github.com/18848298290-del/astrbot_plugin_fapi>
+
+### 当前 ZIP 安装迁移到 GitHub 更新
+
+当前版本如果是通过 ZIP 上传安装，AstrBot 会把安装来源记录为 `upload`，不会仅凭 `metadata.yaml` 中的 `repo` 自动启用更新。只需迁移一次：
+
+1. 打开 AstrBot 管理面板的“插件 → 已安装”。
+2. 找到“FAPI 账号互通”，选择“更换插件源”。
+3. 选择“直接使用仓库地址”，确认仓库为上面的 GitHub 地址，然后保存。
+4. 以后在同一插件卡片上点击“更新”即可拉取 GitHub `main` 分支的最新代码。
+
+如果当前管理面板没有“更换插件源”，卸载插件时不要勾选删除插件配置和持久化数据，然后点击“安装插件（+）→ 从链接安装”，填入上面的 GitHub 仓库地址。完成这一次安装后，后续不再需要上传 ZIP。
+
+### 以后发布新版
+
+每次发布时同步修改 `metadata.yaml` 和 `main.py` 中的版本号，并在 `CHANGELOG.md` 记录变更，然后将代码推送到 GitHub `main` 分支。AstrBot 的仓库更新直接下载默认分支最新代码，不要求创建 GitHub Release，也不要求提交到 AstrBot 插件市场。
+
+仓库根目录必须继续保留 `main.py`、`metadata.yaml`、`requirements.txt` 等插件文件，不能在仓库内再套一层插件目录。
 
 升级不会删除原绑定表。3.1.0 会按需将旧表中的 QQ 号、OpenID 和群 ID 字段扩容为 128 字符，并改为区分大小写的二进制排序规则；数据库用户需要 `ALTER` 权限。
 

@@ -44,7 +44,7 @@ class GroupCommandContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到和群红包",
-    "3.1.1",
+    "3.1.2",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -465,7 +465,7 @@ class FapiPlugin(Star):
             )
             return
         if total_units < count * MIN_RED_PACKET_UNITS:
-            yield event.plain_result("红包总金额不足，每份至少需要 $0.01。")
+            yield event.plain_result("红包总金额不足，每份至少需要 USD 0.01。")
             return
 
         now = datetime.now(self._reward_timezone)
@@ -504,14 +504,14 @@ class FapiPlugin(Star):
             f"总金额：{self._format_units(packet.total_units)}\n"
             f"份数：{packet.total_count}\n"
             f"有效期：{self._red_packet_expire_minutes} 分钟\n"
-            "发送 /fapi 抢红包 领取"
+            f"领取指令：/fapi 抢红包 {packet.packet_id}"
         )
 
     @fapi.command("抢红包", alias={"claim"})
     async def claim_red_packet(
         self,
         event: AstrMessageEvent,
-        packet_id: int = 0,
+        packet_id: str = "",
     ):
         """领取当前群的指定红包或最新红包。"""
         command_context, context_error = self._group_command_context(event)
@@ -521,7 +521,8 @@ class FapiPlugin(Star):
         assert command_context is not None
         qq_id = command_context.sender_id
         group_id = command_context.group_id
-        if packet_id < 0:
+        parsed_packet_id = self._parse_optional_packet_id(packet_id)
+        if parsed_packet_id is None:
             yield event.plain_result("红包编号不正确。")
             return
         try:
@@ -538,7 +539,7 @@ class FapiPlugin(Star):
                 group_id=group_id,
                 qq_id=qq_id,
                 tokenrouter_user_id=binding.tokenrouter_user_id,
-                packet_id=packet_id or None,
+                packet_id=parsed_packet_id or None,
             )
         except RedPacketUnavailable as exc:
             yield event.plain_result(str(exc))
@@ -570,7 +571,7 @@ class FapiPlugin(Star):
     async def red_packet_status(
         self,
         event: AstrMessageEvent,
-        packet_id: int = 0,
+        packet_id: str = "",
     ):
         """查看当前群红包状态。"""
         command_context, context_error = self._group_command_context(event)
@@ -579,13 +580,14 @@ class FapiPlugin(Star):
             return
         assert command_context is not None
         group_id = command_context.group_id
-        if packet_id < 0:
+        parsed_packet_id = self._parse_optional_packet_id(packet_id)
+        if parsed_packet_id is None:
             yield event.plain_result("红包编号不正确。")
             return
         try:
             packet = await self.rewards.get_red_packet(
                 group_id=group_id,
-                packet_id=packet_id or None,
+                packet_id=parsed_packet_id or None,
             )
         except RewardDatabaseError as exc:
             logger.error("FAPI 查询红包状态失败：%s", exc)
@@ -835,7 +837,19 @@ class FapiPlugin(Star):
         whole, fraction = f"{decimal_value:,.8f}".split(".")
         fraction = fraction.rstrip("0")
         fraction = fraction.ljust(2, "0")
-        return f"${whole}.{fraction}"
+        # QQ 官方机器人默认使用 Markdown，美元符号会被配对解析为公式。
+        return f"USD {whole}.{fraction}"
+
+    @staticmethod
+    def _parse_optional_packet_id(value: object) -> int | None:
+        text = str(value).strip()
+        if not text:
+            return 0
+        try:
+            packet_id = int(text)
+        except (TypeError, ValueError):
+            return None
+        return packet_id if packet_id >= 0 else None
 
     @staticmethod
     def _format_units(units: int) -> str:
