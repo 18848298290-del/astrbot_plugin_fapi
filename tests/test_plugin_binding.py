@@ -20,6 +20,13 @@ def load_plugin_module():
     api = types.ModuleType("astrbot.api")
     event_module = types.ModuleType("astrbot.api.event")
     star_module = types.ModuleType("astrbot.api.star")
+    core_module = types.ModuleType("astrbot.core")
+    core_module.__path__ = []
+    core_star_module = types.ModuleType("astrbot.core.star")
+    core_star_module.__path__ = []
+    core_filter_module = types.ModuleType("astrbot.core.star.filter")
+    core_filter_module.__path__ = []
+    command_module = types.ModuleType("astrbot.core.star.filter.command")
 
     class AstrBotConfig(dict):
         pass
@@ -37,6 +44,9 @@ def load_plugin_module():
         def __init__(self, context):
             self.context = context
 
+    class GreedyStr(str):
+        pass
+
     def register(*_args, **_kwargs):
         return lambda plugin_class: plugin_class
 
@@ -47,6 +57,7 @@ def load_plugin_module():
     star_module.Context = object
     star_module.Star = Star
     star_module.register = register
+    command_module.GreedyStr = GreedyStr
 
     modules = {
         package_name: package,
@@ -54,6 +65,10 @@ def load_plugin_module():
         "astrbot.api": api,
         "astrbot.api.event": event_module,
         "astrbot.api.star": star_module,
+        "astrbot.core": core_module,
+        "astrbot.core.star": core_star_module,
+        "astrbot.core.star.filter": core_filter_module,
+        "astrbot.core.star.filter.command": command_module,
     }
     sys.modules.update(modules)
 
@@ -350,6 +365,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         replies = await collect(
             self.plugin.admin_private(
                 FakeEvent(group_id=None, astrbot_admin=True),
+                "",
             )
         )
 
@@ -373,8 +389,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         replies = await collect(
             self.plugin.admin_private(
                 FakeEvent(group_id=None, astrbot_admin=False),
-                "查询",
-                "alice",
+                "查询 alice",
             )
         )
 
@@ -384,10 +399,30 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         replies = await collect(
             self.plugin.admin_private(
                 FakeEvent(group_id="987654321", astrbot_admin=True),
+                "",
             )
         )
 
         self.assertEqual(replies, ["管理员管理指令只能在私聊中使用。"])
+
+    async def test_private_admin_fails_closed_when_group_lookup_raises(self):
+        class ForbiddenClient:
+            def __getattr__(_self, name):
+                async def forbidden(*_args, **_kwargs):
+                    raise AssertionError(f"会话门禁失败后不应调用 {name}")
+
+                return forbidden
+
+        event = FakeEvent(group_id="987654321", astrbot_admin=True)
+
+        def broken_group_lookup():
+            raise RuntimeError("adapter failure")
+
+        event.get_group_id = broken_group_lookup
+        self.plugin.client = ForbiddenClient()
+        replies = await collect(self.plugin.admin_private(event, "查询 alice"))
+
+        self.assertEqual(replies, ["无法确认当前会话类型，请稍后重试。"])
 
     async def test_private_admin_accepts_async_admin_check(self):
         event = FakeEvent(group_id=None)
@@ -396,7 +431,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             return True
 
         event.is_admin = is_admin
-        replies = await collect(self.plugin.admin_private(event))
+        replies = await collect(self.plugin.admin_private(event, ""))
 
         self.assertIn("FAPI 管理员私聊菜单", replies[0])
 
@@ -418,8 +453,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         replies = await collect(
             self.plugin.admin_private(
                 FakeEvent(group_id=None, astrbot_admin=True),
-                "查询",
-                "alice",
+                "查询 alice",
             )
         )
 
@@ -429,6 +463,30 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("余额：USD 12.50", replies[0])
         self.assertIn("已使用（近30天）：USD 3.25", replies[0])
         self.assertIn("并发上限：8", replies[0])
+
+    async def test_private_admin_keeps_spaces_in_query_username(self):
+        class Client:
+            async def find_users_by_exact_username(_self, username):
+                self.assertEqual(username, "Alice Smith")
+                return [user(7, "Alice Smith", "alice@example.com")]
+
+            async def get_balance_summary(_self, user_id):
+                self.assertEqual(user_id, 7)
+                return SimpleNamespace(
+                    balance=Decimal("12.5"),
+                    used_last_30_days=Decimal("3.25"),
+                    concurrency=8,
+                )
+
+        self.plugin.client = Client()
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=True),
+                "查询 Alice Smith",
+            )
+        )
+
+        self.assertIn("用户名：Alice Smith", replies[0])
 
     async def test_private_admin_queries_overview_and_global_rpm(self):
         class Client:
@@ -492,8 +550,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         replies = await collect(
             self.plugin.admin_private(
                 FakeEvent(group_id=None, astrbot_admin=True),
-                "RPM",
-                "alice",
+                "RPM alice",
             )
         )
 
@@ -519,7 +576,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
                     items=(
                         SimpleNamespace(
                             user_id=7,
-                            username="alice\nspoofed",
+                            username="alice\u2028spoofed\u202e<br/>[fake](x)$",
                             actual_cost=Decimal("3.25"),
                             requests=12,
                             tokens=2000,
@@ -532,8 +589,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         replies = await collect(
             self.plugin.admin_private(
                 FakeEvent(group_id=None, astrbot_admin=True),
-                "排行",
-                "5",
+                "排行 5",
             )
         )
 
@@ -541,7 +597,72 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.values["timezone_name"], "Asia/Shanghai")
         self.assertIn("用户消费排行", replies[0])
         self.assertIn("alice spoofed", replies[0])
+        self.assertEqual(len(replies[0].splitlines()), 3)
+        self.assertNotIn("\u2028", replies[0])
+        self.assertNotIn("\u202e", replies[0])
+        self.assertNotIn("<br/>", replies[0])
+        self.assertNotIn("[fake](x)", replies[0])
         self.assertNotIn("@example.com", replies[0])
+
+    async def test_private_admin_ranking_rejects_invalid_timezone(self):
+        plugin = self.module.FapiPlugin(
+            object(),
+            {
+                "allowed_group_id": "987654321",
+                "reward_timezone": "Not/A_Zone",
+            },
+        )
+        await plugin.client.close()
+
+        class ForbiddenClient:
+            async def get_user_spending_ranking(_self, **_values):
+                raise AssertionError("时区无效时不应发起排行请求")
+
+        plugin.client = ForbiddenClient()
+        replies = await collect(
+            plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=True),
+                "排行",
+            )
+        )
+
+        self.assertEqual(
+            replies,
+            ["排行时区配置不正确，请检查 reward_timezone。"],
+        )
+
+    async def test_ranking_ignores_unrelated_reward_config_error(self):
+        plugin = self.module.FapiPlugin(
+            object(),
+            {
+                "allowed_group_id": "987654321",
+                "reward_timezone": "Asia/Shanghai",
+                "checkin_reward_min": "invalid",
+            },
+        )
+        await plugin.client.close()
+
+        class Client:
+            async def get_user_spending_ranking(_self, **values):
+                self.assertEqual(values["timezone_name"], "Asia/Shanghai")
+                return SimpleNamespace(
+                    start_date=values["ranking_date"],
+                    end_date=values["ranking_date"],
+                    total_actual_cost=Decimal("0"),
+                    total_requests=0,
+                    total_tokens=0,
+                    items=(),
+                )
+
+        plugin.client = Client()
+        replies = await collect(
+            plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=True),
+                "排行",
+            )
+        )
+
+        self.assertIn("用户消费排行", replies[0])
 
     async def test_private_admin_rejects_invalid_ranking_limit_before_api(self):
         class ForbiddenClient:
@@ -552,8 +673,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         replies = await collect(
             self.plugin.admin_private(
                 FakeEvent(group_id=None, astrbot_admin=True),
-                "排行",
-                "21",
+                "排行 21",
             )
         )
 
@@ -574,9 +694,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         replies = await collect(
             self.plugin.admin_private(
                 FakeEvent(group_id=None, astrbot_admin=True),
-                "加余额",
-                "alice",
-                "1.25",
+                "加余额 alice 1.25",
             )
         )
 
@@ -606,10 +724,10 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         )
 
         first = await collect(
-            self.plugin.admin_private(event, "加余额", "alice", "1.25")
+            self.plugin.admin_private(event, "加余额 alice 1.25")
         )
         second = await collect(
-            self.plugin.admin_private(event, "加余额", "alice", "1.25")
+            self.plugin.admin_private(event, "加余额 alice 1.25")
         )
 
         self.assertIn("余额调整成功", first[0])
@@ -629,6 +747,68 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_private_admin_adjusts_spaced_username(self):
+        class Client:
+            def __init__(_self):
+                _self.adjustments = []
+
+            async def find_users_by_exact_username(_self, username):
+                self.assertEqual(username, "Alice Smith")
+                return [user(7, "Alice Smith", "alice@example.com")]
+
+            async def adjust_balance(_self, **values):
+                _self.adjustments.append(values)
+                return SimpleNamespace(balance=Decimal("13.75"))
+
+        client = Client()
+        self.plugin.client = client
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(
+                    group_id=None,
+                    astrbot_admin=True,
+                    message_id="admin-spaced-username",
+                ),
+                "加余额 Alice Smith 1.25",
+            )
+        )
+
+        self.assertIn("余额调整成功", replies[0])
+        self.assertEqual(client.adjustments[0]["amount"], Decimal("1.25"))
+
+    async def test_private_admin_rejects_malformed_trailing_arguments(self):
+        class ForbiddenClient:
+            def __getattr__(_self, name):
+                async def forbidden(*_args, **_kwargs):
+                    raise AssertionError(f"非法参数不应调用 {name}")
+
+                return forbidden
+
+        self.plugin.client = ForbiddenClient()
+        event = FakeEvent(group_id=None, astrbot_admin=True)
+
+        adjustment = await collect(
+            self.plugin.admin_private(event, "加余额 alice 1.25 trailing")
+        )
+        overview = await collect(
+            self.plugin.admin_private(event, "概览 trailing")
+        )
+        ranking = await collect(
+            self.plugin.admin_private(event, "排行 5 trailing")
+        )
+
+        self.assertIn("金额不正确", adjustment[0])
+        self.assertEqual(overview, ["用法：/fapi 管理 概览"])
+        self.assertEqual(ranking, ["排行数量必须是 1 到 20 的整数。"])
+
+    def test_safe_reply_field_neutralizes_structural_markup(self):
+        unsafe = "alice\u2028fake\u2029line\u202e<br/>[x](url)$value$"
+        safe = self.plugin._safe_reply_field(unsafe)
+
+        self.assertEqual(len(safe.splitlines()), 1)
+        for forbidden in ("\u2028", "\u2029", "\u202e", "<", ">", "[", "]", "$"):
+            self.assertNotIn(forbidden, safe)
+
     async def test_private_admin_validates_write_before_user_lookup(self):
         class ForbiddenClient:
             async def find_users_by_exact_username(_self, _username):
@@ -638,7 +818,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent(group_id=None, astrbot_admin=True)
 
         too_large = await collect(
-            self.plugin.admin_private(event, "加余额", "alice", "1000.00000001")
+            self.plugin.admin_private(event, "加余额 alice 1000.00000001")
         )
         missing_message_id = await collect(
             self.plugin.admin_private(
@@ -648,9 +828,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
                     message_id=None,
                     raw_message={},
                 ),
-                "减余额",
-                "alice",
-                "1.00",
+                "减余额 alice 1.00",
             )
         )
 
@@ -682,11 +860,11 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent(group_id=None, astrbot_admin=True)
 
         insufficient = await collect(
-            self.plugin.admin_private(event, "减余额", "alice", "1.00")
+            self.plugin.admin_private(event, "减余额 alice 1.00")
         )
         client.unknown = True
         unknown = await collect(
-            self.plugin.admin_private(event, "加余额", "alice", "1.00")
+            self.plugin.admin_private(event, "加余额 alice 1.00")
         )
 
         self.assertEqual(insufficient, ["用户余额不足，本次未扣减。"])

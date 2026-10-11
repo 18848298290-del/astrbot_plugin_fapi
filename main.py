@@ -8,11 +8,13 @@ from decimal import Decimal, InvalidOperation
 import hashlib
 import inspect
 import math
+import unicodedata
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.star.filter.command import GreedyStr
 
 from .binding_store import BindStatus, BindingDatabaseError, MySQLBindingStore
 from .game_store import (
@@ -51,6 +53,27 @@ from .tokenrouter_client import (
 _SUPPORTED_QQ_PLATFORMS = frozenset({"aiocqhttp", "qq_official"})
 _GAME_REFUND_MAX_ATTEMPTS = 5
 _SLOT_ANIMATION_DELAY_SECONDS = 1.2
+_REPLY_MARKUP_TRANSLATION = str.maketrans(
+    {
+        "\\": "＼",
+        "`": "｀",
+        "*": "＊",
+        "_": "＿",
+        "{": "｛",
+        "}": "｝",
+        "[": "［",
+        "]": "］",
+        "(": "（",
+        ")": "）",
+        "#": "＃",
+        "!": "！",
+        "|": "｜",
+        ">": "＞",
+        "<": "＜",
+        "~": "～",
+        "$": "＄",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +93,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和余额游戏",
-    "3.7.0",
+    "3.7.1",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -175,11 +198,18 @@ class FapiPlugin(Star):
             min(3600, math.ceil(request_timeout) * 4 + 60),
         )
         self._reward_config_error = ""
+        self._reward_timezone_error = ""
         self._game_config_error = ""
         try:
             self._reward_timezone = ZoneInfo(
                 str(config.get("reward_timezone", "Asia/Shanghai")).strip()
             )
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            self._reward_timezone = timezone.utc
+            self._reward_timezone_error = str(exc)
+            self._reward_config_error = str(exc)
+
+        try:
             self._checkin_reward_min_units = money_to_units(
                 config.get("checkin_reward_min", "0.01")
             )
@@ -214,8 +244,9 @@ class FapiPlugin(Star):
                 raise ValueError("红包最大份数必须在 1 到 1000 之间")
             if not 1 <= self._red_packet_expire_minutes <= 1440:
                 raise ValueError("红包有效期必须在 1 到 1440 分钟之间")
-        except (ValueError, ZoneInfoNotFoundError) as exc:
-            self._reward_config_error = str(exc)
+        except ValueError as exc:
+            if not self._reward_config_error:
+                self._reward_config_error = str(exc)
 
         try:
             self._robbery_enabled = bool(config.get("robbery_enabled", True))
@@ -291,9 +322,7 @@ class FapiPlugin(Star):
     async def admin_private(
         self,
         event: AstrMessageEvent,
-        action: str = "",
-        username: str = "",
-        amount: str = "",
+        raw_args: GreedyStr,
     ):
         """在私聊中执行受限的中转站管理操作。"""
         admin_context, context_error = await self._private_admin_context(event)
@@ -305,8 +334,14 @@ class FapiPlugin(Star):
             yield event.plain_result("管理员私聊功能当前未开启。")
             return
 
-        normalized_action = action.strip().casefold()
+        command_text = str(raw_args).strip()
+        action, separator, arguments = command_text.partition(" ")
+        arguments = arguments.strip() if separator else ""
+        normalized_action = action.casefold()
         if normalized_action in {"", "帮助", "菜单", "help"}:
+            if arguments:
+                yield event.plain_result("用法：/fapi 管理")
+                return
             adjustment_limit = (
                 "配置错误"
                 if self._admin_config_error
@@ -354,10 +389,27 @@ class FapiPlugin(Star):
             yield event.plain_result("未知管理操作，请发送 /fapi 管理。")
             return
 
-        if operation == "overview":
-            if username or amount:
-                yield event.plain_result("用法：/fapi 管理 概览")
+        username = ""
+        amount = ""
+        if operation in {"query", "rpm"}:
+            username = arguments
+        elif operation == "ranking":
+            username = arguments
+        elif operation in {"add", "subtract"}:
+            username, separator, amount = arguments.rpartition(" ")
+            username = username.strip()
+            amount = amount.strip() if separator else ""
+            if not username or not amount:
+                operation_name = "加余额" if operation == "add" else "减余额"
+                yield event.plain_result(
+                    f"用法：/fapi 管理 {operation_name} <用户名> <金额>"
+                )
                 return
+        elif arguments:
+            yield event.plain_result("用法：/fapi 管理 概览")
+            return
+
+        if operation == "overview":
             try:
                 overview = await self.client.get_dashboard_overview()
             except TokenRouterError as exc:
@@ -377,8 +429,10 @@ class FapiPlugin(Star):
             return
 
         if operation == "ranking":
-            if amount:
-                yield event.plain_result("用法：/fapi 管理 排行 [数量]")
+            if getattr(self, "_reward_timezone_error", ""):
+                yield event.plain_result(
+                    "排行时区配置不正确，请检查 reward_timezone。"
+                )
                 return
             raw_limit = username.strip()
             try:
@@ -1670,15 +1724,13 @@ class FapiPlugin(Star):
             return None, "该指令仅支持 QQ 机器人平台。"
 
         get_group_id = getattr(event, "get_group_id", None)
+        if not callable(get_group_id):
+            return None, "无法确认当前会话类型，请稍后重试。"
         try:
-            group_id = (
-                str(get_group_id() or "").strip()
-                if callable(get_group_id)
-                else ""
-            )
+            group_id = str(get_group_id() or "").strip()
         except Exception:
-            group_id = ""
-        if self._valid_platform_identifier(group_id):
+            return None, "无法确认当前会话类型，请稍后重试。"
+        if group_id:
             return None, "管理员管理指令只能在私聊中使用。"
 
         try:
@@ -1752,12 +1804,13 @@ class FapiPlugin(Star):
         text = "".join(
             (
                 character
-                if ord(character) >= 32 and not 127 <= ord(character) <= 159
+                if unicodedata.category(character)
+                not in {"Cc", "Cf", "Cs", "Zl", "Zp"}
                 else " "
             )
             for character in str(value)
         )
-        return text[:maximum]
+        return text.translate(_REPLY_MARKUP_TRANSLATION)[:maximum]
 
     def _admin_stats_timezone(self):
         return getattr(self, "_reward_timezone", timezone.utc)
