@@ -1,0 +1,149 @@
+{
+  "allowed_group_id": {
+    "description": "指定 QQ 群 ID",
+    "type": "string",
+    "hint": "所有 /fapi 操作只能在此群使用。OneBot 填群号；QQ 官方机器人填群 group_openid。留空时插件拒绝所有业务指令。",
+    "default": ""
+  },
+  "tokenrouter_url": {
+    "description": "TokenRouter 地址",
+    "type": "string",
+    "hint": "填写站点根地址，例如 https://tokenrouter.example.com，不要填写 /api/v1。",
+    "default": "http://127.0.0.1:8080"
+  },
+  "admin_api_key": {
+    "description": "管理 API Key",
+    "type": "string",
+    "hint": "用于查询用户并通过创建且兑换余额码发放签到、红包奖励。请仅授予可信机器人使用。",
+    "default": "",
+    "secret": true
+  },
+  "request_timeout": {
+    "description": "中转站请求超时秒数",
+    "type": "int",
+    "default": 10,
+    "slider": {"min": 3, "max": 60, "step": 1}
+  },
+  "verify_ssl": {
+    "description": "验证中转站 HTTPS 证书",
+    "type": "bool",
+    "default": true
+  },
+  "mysql_host": {
+    "description": "远程 MySQL 地址",
+    "type": "string",
+    "hint": "填写域名或 IP，不要包含 mysql://。",
+    "default": ""
+  },
+  "mysql_port": {
+    "description": "远程 MySQL 端口",
+    "type": "int",
+    "default": 3306
+  },
+  "mysql_user": {
+    "description": "远程 MySQL 用户名",
+    "type": "string",
+    "default": ""
+  },
+  "mysql_password": {
+    "description": "远程 MySQL 密码",
+    "type": "string",
+    "default": "",
+    "secret": true
+  },
+  "mysql_database": {
+    "description": "远程 MySQL 数据库名",
+    "type": "string",
+    "default": ""
+  },
+  "mysql_table": {
+    "description": "绑定数据表名",
+    "type": "string",
+    "hint": "插件启动时会自动创建该表；仅支持字母、数字和下划线。",
+    "default": "astrbot_fapi_bindings"
+  },
+  "mysql_connect_timeout": {
+    "description": "MySQL 连接超时秒数",
+    "type": "int",
+    "default": 10,
+    "slider": {"min": 3, "max": 60, "step": 1}
+  },
+  "mysql_ssl_enabled": {
+    "description": "启用 MySQL TLS",
+    "type": "bool",
+    "hint": "远程数据库建议保持开启。",
+    "default": true
+  },
+  "mysql_ssl_verify": {
+    "description": "验证 MySQL TLS 证书",
+    "type": "bool",
+    "hint": "仅在服务器使用无法验证的自签名证书时关闭。",
+    "default": true
+  },
+  "checkin_reward": {
+    "description": "每次签到奖励",
+    "type": "string",
+    "hint": "按中转站余额单位填写，最多 8 位小数。",
+    "default": "0.05"
+  },
+  "checkin_daily_budget": {
+    "description": "签到每日总预算",
+    "type": "string",
+    "hint": "按奖励时区统计，达到上限后当天停止新签到奖励。",
+    "default": "10.00"
+  },
+  "red_packet_max_total": {
+    "description": "单个红包金额上限",
+    "type": "string",
+    "default": "20.00"
+  },
+  "red_packet_daily_budget": {
+    "description": "红包每日总预算",
+    "type": "string",
+    "hint": "创建红包时一次性预留全部金额；未领取金额也计入当天预算。",
+    "default": "100.00"
+  },
+  "red_packet_max_count": {
+    "description": "单个红包最大份数",
+    "type": "int",
+    "default": 100,
+    "slider": {"min": 1, "max": 1000, "step": 1}
+  },
+  "red_packet_expire_minutes": {
+    "description": "红包有效分钟数",
+    "type": "int",
+    "default": 60,
+    "slider": {"min": 1, "max": 1440, "step": 1}
+  },
+  "reward_timezone": {
+    "description": "奖励日期时区",
+    "type": "string",
+    "hint": "用于签到日期和每日预算统计，例如 Asia/Shanghai。",
+    "default": "Asia/Shanghai"
+  },
+  "mysql_reward_jobs_table": {
+    "description": "奖励任务表名",
+    "type": "string",
+    "default": "astrbot_fapi_reward_jobs"
+  },
+  "mysql_checkins_table": {
+    "description": "签到记录表名",
+    "type": "string",
+    "default": "astrbot_fapi_checkins"
+  },
+  "mysql_red_packets_table": {
+    "description": "红包记录表名",
+    "type": "string",
+    "default": "astrbot_fapi_red_packets"
+  },
+  "mysql_red_claims_table": {
+    "description": "红包领取表名",
+    "type": "string",
+    "default": "astrbot_fapi_red_claims"
+  },
+  "mysql_reward_budgets_table": {
+    "description": "奖励预算表名",
+    "type": "string",
+    "default": "astrbot_fapi_reward_budgets"
+  }
+}
