@@ -871,7 +871,13 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.plugin.bindings = bindings
         self.plugin.games = games
         self.plugin.client = client
-        self.module.roll_success = lambda _rate: True
+        rates = []
+
+        def successful_roll(rate):
+            rates.append(rate)
+            return True
+
+        self.module.roll_success = successful_roll
 
         first_reply = await collect(self.plugin.robbery(event))
         second_reply = await collect(self.plugin.robbery(event))
@@ -886,6 +892,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(bindings.calls, ["12345", "67890"])
+        self.assertEqual(rates, [self.plugin._robbery_success_rate])
         self.assertEqual(len(games.reserve_calls), 1)
         reservation = games.reserve_calls[0]
         self.assertEqual(reservation["debit_user_id"], 22)
@@ -919,6 +926,118 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls, [])
         self.assertEqual(games.reserve_calls[0]["debit_units"], 0)
         self.assertEqual(games.reserve_calls[0]["credit_units"], 0)
+
+    async def test_robbery_backfire_transfers_actor_balance_to_target(self):
+        event = FakeEvent(
+            messages=[SimpleNamespace(type="At", qq="67890")],
+            message_id="robbery-backfire-message",
+        )
+        games = InMemoryGameStore(self.module)
+        client = BalanceClient(self.module)
+        self.plugin.bindings = GameBindings({"12345": 11, "67890": 22})
+        self.plugin.games = games
+        self.plugin.client = client
+        rolls = iter((False, True))
+        self.module.roll_success = lambda _rate: next(rolls)
+
+        replies = await collect(self.plugin.robbery(event))
+
+        self.assertEqual(
+            replies,
+            [
+                "打劫失败，触发反噬\n"
+                "损失：USD 0.05\n"
+                "金额已转入对方账户。"
+            ],
+        )
+        reservation = games.reserve_calls[0]
+        self.assertFalse(reservation["won"])
+        self.assertEqual(reservation["debit_user_id"], 11)
+        self.assertEqual(reservation["credit_user_id"], 22)
+        self.assertEqual(reservation["debit_units"], 5_000_000)
+        self.assertEqual(reservation["credit_units"], 5_000_000)
+        self.assertEqual(
+            [(call["user_id"], call["operation"]) for call in client.calls],
+            [(11, "subtract"), (22, "add")],
+        )
+        self.assertEqual(
+            self.plugin._game_reply(
+                replace(
+                    games.operation,
+                    status=self.module.GameStatus.REFUNDED,
+                )
+            ),
+            "反噬结算失败，扣除的金额已经退回你的账户。",
+        )
+        self.assertEqual(
+            self.plugin._game_reply(
+                replace(
+                    games.operation,
+                    status=self.module.GameStatus.MANUAL_REVIEW,
+                )
+            ),
+            "反噬结算异常，退款需要管理员人工处理。",
+        )
+        self.assertEqual(
+            self.plugin._game_reply(
+                replace(
+                    games.operation,
+                    status=self.module.GameStatus.PENDING_REFUND,
+                )
+            ),
+            "打劫失败并触发反噬，余额正在结算，请稍后查询。",
+        )
+        self.assertEqual(
+            self.plugin._game_reply(
+                replace(
+                    games.operation,
+                    status=self.module.GameStatus.FAILED,
+                )
+            ),
+            "反噬结算失败，本次未扣款。",
+        )
+
+    async def test_robbery_backfire_does_not_credit_when_actor_balance_is_low(self):
+        event = FakeEvent(messages=[SimpleNamespace(type="At", qq="67890")])
+        games = InMemoryGameStore(self.module)
+        client = BalanceClient(self.module, fail_on=1)
+        self.plugin.bindings = GameBindings({"12345": 11, "67890": 22})
+        self.plugin.games = games
+        self.plugin.client = client
+        rolls = iter((False, True))
+        self.module.roll_success = lambda _rate: next(rolls)
+
+        replies = await collect(self.plugin.robbery(event))
+
+        self.assertEqual(
+            replies,
+            ["打劫失败并触发反噬，但你的余额不足，本次没有余额变动。"],
+        )
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["user_id"], 11)
+        self.assertEqual(client.calls[0]["operation"], "subtract")
+
+    async def test_disabled_robbery_backfire_never_rolls_or_charges(self):
+        event = FakeEvent(messages=[SimpleNamespace(type="At", qq="67890")])
+        games = InMemoryGameStore(self.module)
+        client = BalanceClient(self.module)
+        self.plugin.bindings = GameBindings({"12345": 11, "67890": 22})
+        self.plugin.games = games
+        self.plugin.client = client
+        self.plugin._robbery_backfire_enabled = False
+        rates = []
+
+        def failed_roll(rate):
+            rates.append(rate)
+            return False
+
+        self.module.roll_success = failed_roll
+
+        replies = await collect(self.plugin.robbery(event))
+
+        self.assertEqual(replies, ["打劫失败，本次没有余额变动。"])
+        self.assertEqual(rates, [self.plugin._robbery_success_rate])
+        self.assertEqual(client.calls, [])
 
     async def test_robbery_insufficient_target_balance_never_credits_actor(self):
         event = FakeEvent(messages=[SimpleNamespace(type="At", qq="67890")])

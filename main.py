@@ -58,7 +58,7 @@ class GroupCommandContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和余额游戏",
-    "3.3.1",
+    "3.4.0",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -202,6 +202,15 @@ class FapiPlugin(Star):
             self._robbery_success_rate = int(
                 config.get("robbery_success_rate", 30)
             )
+            self._robbery_backfire_enabled = bool(
+                config.get("robbery_backfire_enabled", True)
+            )
+            self._robbery_backfire_rate = int(
+                config.get("robbery_backfire_rate", 20)
+            )
+            self._robbery_backfire_amount_units = money_to_units(
+                config.get("robbery_backfire_amount", "0.05")
+            )
             self._robbery_cooldown_seconds = int(
                 config.get("robbery_cooldown_seconds", 300)
             )
@@ -216,6 +225,7 @@ class FapiPlugin(Star):
             )
             for name, rate in (
                 ("打劫", self._robbery_success_rate),
+                ("打劫反噬", self._robbery_backfire_rate),
                 ("老虎机", self._slot_success_rate),
             ):
                 if not 0 <= rate <= 100:
@@ -754,7 +764,23 @@ class FapiPlugin(Star):
                         early_reply = "被 @ 用户尚未绑定中转站账号，无法打劫。"
                     else:
                         won = roll_success(self._robbery_success_rate)
-                        amount_units = self._robbery_amount_units if won else 0
+                        backfired = (
+                            not won
+                            and self._robbery_backfire_enabled
+                            and roll_success(self._robbery_backfire_rate)
+                        )
+                        if won:
+                            debit_user_id = target_binding.tokenrouter_user_id
+                            credit_user_id = actor_binding.tokenrouter_user_id
+                            amount_units = self._robbery_amount_units
+                        elif backfired:
+                            debit_user_id = actor_binding.tokenrouter_user_id
+                            credit_user_id = target_binding.tokenrouter_user_id
+                            amount_units = self._robbery_backfire_amount_units
+                        else:
+                            debit_user_id = target_binding.tokenrouter_user_id
+                            credit_user_id = None
+                            amount_units = 0
                         reservation = await self.games.reserve_game(
                             operation_key=operation_key,
                             game_type="robbery",
@@ -763,10 +789,8 @@ class FapiPlugin(Star):
                             actor_user_id=actor_binding.tokenrouter_user_id,
                             target_qq_id=target_qq_id,
                             target_user_id=target_binding.tokenrouter_user_id,
-                            debit_user_id=target_binding.tokenrouter_user_id,
-                            credit_user_id=(
-                                actor_binding.tokenrouter_user_id if won else None
-                            ),
+                            debit_user_id=debit_user_id,
+                            credit_user_id=credit_user_id,
                             debit_units=amount_units,
                             credit_units=amount_units,
                             won=won,
@@ -1229,21 +1253,38 @@ class FapiPlugin(Star):
             GameStatus.PENDING_REFUND,
         }
         if operation.game_type == "robbery":
+            backfired = FapiPlugin._is_robbery_backfire(operation)
             if operation.status in pending:
+                if backfired:
+                    return "打劫失败并触发反噬，余额正在结算，请稍后查询。"
                 return "打劫结果已锁定，余额正在结算，请稍后查询。"
             if operation.status == GameStatus.MANUAL_REVIEW:
+                if backfired:
+                    return "反噬结算异常，退款需要管理员人工处理。"
                 return "打劫结算异常，退款需要管理员人工处理。"
             if operation.status == GameStatus.INSUFFICIENT:
+                if backfired:
+                    return "打劫失败并触发反噬，但你的余额不足，本次没有余额变动。"
                 return "对方余额不足，本次打劫未得手。"
             if operation.status == GameStatus.REFUNDED:
+                if backfired:
+                    return "反噬结算失败，扣除的金额已经退回你的账户。"
                 return "转账结算失败，扣除的金额已经退回对方账户。"
             if operation.status == GameStatus.FAILED:
+                if backfired:
+                    return "反噬结算失败，本次未扣款。"
                 return "打劫结算失败，本次未扣款。"
             if operation.won:
                 return (
                     "打劫成功\n"
                     f"获得：{FapiPlugin._format_units(operation.credit_units)}\n"
                     "金额已从对方账户转入你的账户。"
+                )
+            if backfired:
+                return (
+                    "打劫失败，触发反噬\n"
+                    f"损失：{FapiPlugin._format_units(operation.debit_units)}\n"
+                    "金额已转入对方账户。"
                 )
             return "打劫失败，本次没有余额变动。"
 
@@ -1266,6 +1307,18 @@ class FapiPlugin(Star):
         return (
             "老虎机未中奖\n"
             f"本次投入：{FapiPlugin._format_units(operation.debit_units)}"
+        )
+
+    @staticmethod
+    def _is_robbery_backfire(operation: GameOperation) -> bool:
+        return bool(
+            operation.game_type == "robbery"
+            and not operation.won
+            and operation.debit_units > 0
+            and operation.credit_units == operation.debit_units
+            and operation.debit_user_id == operation.actor_user_id
+            and operation.target_user_id is not None
+            and operation.credit_user_id == operation.target_user_id
         )
 
     @staticmethod

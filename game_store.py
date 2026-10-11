@@ -1126,11 +1126,6 @@ class MySQLGameStore:
             "actor_user_id",
             "target_qq_id",
             "target_user_id",
-            "debit_user_id",
-            "credit_user_id",
-            "debit_units",
-            "credit_units",
-            "won",
         )
         if any(getattr(existing, key) != values[key] for key in compared):
             raise GameOperationConflict(

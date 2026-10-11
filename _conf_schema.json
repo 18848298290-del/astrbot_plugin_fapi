@@ -138,6 +138,24 @@
     "default": 30,
     "slider": {"min": 0, "max": 100, "step": 1}
   },
+  "robbery_backfire_enabled": {
+    "description": "启用打劫反噬",
+    "type": "bool",
+    "hint": "打劫失败后可按配置概率从发起者扣款并转给被打劫者。",
+    "default": true
+  },
+  "robbery_backfire_rate": {
+    "description": "失败后反噬率（百分比）",
+    "type": "int",
+    "default": 20,
+    "slider": {"min": 0, "max": 100, "step": 1}
+  },
+  "robbery_backfire_amount": {
+    "description": "打劫反噬金额",
+    "type": "string",
+    "hint": "触发反噬时从打劫发起者余额扣除，并转入被打劫者余额。",
+    "default": "0.05"
+  },
   "robbery_cooldown_seconds": {
     "description": "打劫冷却秒数",
     "type": "int",

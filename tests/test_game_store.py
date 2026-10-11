@@ -316,6 +316,41 @@ class ReserveGameTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connection.rollback_count, 0)
         self.assertIn("FOR UPDATE", cursor.executions[0][0])
 
+    async def test_existing_operation_keeps_first_random_financial_outcome(self):
+        persisted = operation_row(
+            debit_user_id=22,
+            credit_user_id=11,
+            debit_units=10_000_000,
+            credit_units=10_000_000,
+            won=True,
+        )
+        cursor = FakeCursor([persisted])
+        store, _, _ = make_store(cursor)
+        competing_values = self.kwargs()
+        competing_values.update(
+            debit_user_id=11,
+            credit_user_id=22,
+            debit_units=5_000_000,
+            credit_units=5_000_000,
+            won=False,
+        )
+
+        result = await store.reserve_game(**competing_values)
+
+        self.assertTrue(result.existing)
+        self.assertTrue(result.operation.won)
+        self.assertEqual(result.operation.debit_user_id, 22)
+        self.assertEqual(result.operation.credit_user_id, 11)
+
+    async def test_existing_operation_still_rejects_changed_target_identity(self):
+        cursor = FakeCursor([operation_row(target_user_id=999)])
+        store, _, connection = make_store(cursor)
+
+        with self.assertRaises(GameOperationConflict):
+            await store.reserve_game(**self.kwargs())
+
+        self.assertEqual(connection.rollback_count, 1)
+
     async def test_cooldown_blocks_new_actor_type_operation(self):
         cursor = FakeCursor([None, {"retry_after_seconds": 42}])
         store, _, connection = make_store(cursor)
