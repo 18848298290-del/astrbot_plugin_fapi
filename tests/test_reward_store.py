@@ -4,11 +4,13 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from reward_store import (
+    CHECKIN_REWARD_STEP_UNITS,
     MIN_RED_PACKET_UNITS,
     MONEY_SCALE,
     MySQLRewardStore,
     _redeem_code,
     money_to_units,
+    random_checkin_reward_units,
     split_red_packet_share,
     units_to_decimal,
 )
@@ -45,6 +47,57 @@ class MoneyUnitsTest(unittest.TestCase):
 
     def test_accepts_zero_only_when_explicitly_allowed(self):
         self.assertEqual(money_to_units("0", allow_zero=True), 0)
+
+
+class CheckinRewardTest(unittest.TestCase):
+    def test_includes_both_ends_of_configured_range(self):
+        minimum = money_to_units("0.01")
+        maximum = money_to_units("0.10")
+
+        self.assertEqual(
+            random_checkin_reward_units(minimum, maximum, randbelow=lambda _n: 0),
+            minimum,
+        )
+        self.assertEqual(
+            random_checkin_reward_units(
+                minimum,
+                maximum,
+                randbelow=lambda choices: choices - 1,
+            ),
+            maximum,
+        )
+
+    def test_uses_one_cent_steps(self):
+        minimum = money_to_units("0.03")
+        reward = random_checkin_reward_units(
+            minimum,
+            money_to_units("0.08"),
+            randbelow=lambda _n: 4,
+        )
+
+        self.assertEqual(reward, money_to_units("0.07"))
+        self.assertEqual(reward % CHECKIN_REWARD_STEP_UNITS, 0)
+
+    def test_budget_tail_is_rounded_down_to_a_cent(self):
+        reward = random_checkin_reward_units(
+            money_to_units("0.01"),
+            money_to_units("0.075"),
+            randbelow=lambda choices: choices - 1,
+        )
+
+        self.assertEqual(reward, money_to_units("0.07"))
+
+    def test_rejects_invalid_range_or_sub_cent_minimum(self):
+        with self.assertRaises(ValueError):
+            random_checkin_reward_units(
+                money_to_units("0.10"),
+                money_to_units("0.01"),
+            )
+        with self.assertRaises(ValueError):
+            random_checkin_reward_units(
+                money_to_units("0.001"),
+                money_to_units("0.01"),
+            )
 
 
 class RedPacketSplitTest(unittest.TestCase):

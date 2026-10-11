@@ -80,11 +80,17 @@
     "hint": "仅在服务器使用无法验证的自签名证书时关闭。",
     "default": true
   },
-  "checkin_reward": {
-    "description": "每次签到奖励",
+  "checkin_reward_min": {
+    "description": "签到奖励最小值",
     "type": "string",
-    "hint": "按中转站余额单位填写，最多 8 位小数。",
-    "default": "0.05"
+    "hint": "新签到会在最小值和最大值之间随机，金额必须是 0.01 的整数倍。",
+    "default": "0.01"
+  },
+  "checkin_reward_max": {
+    "description": "签到奖励最大值",
+    "type": "string",
+    "hint": "包含此上限；当天预算不足上限时，会在剩余额度内随机。",
+    "default": "0.10"
   },
   "checkin_daily_budget": {
     "description": "签到每日总预算",

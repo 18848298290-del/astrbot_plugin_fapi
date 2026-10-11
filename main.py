@@ -44,7 +44,7 @@ class GroupCommandContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到和群红包",
-    "3.1.2",
+    "3.2.0",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -103,8 +103,11 @@ class FapiPlugin(Star):
             self._reward_timezone = ZoneInfo(
                 str(config.get("reward_timezone", "Asia/Shanghai")).strip()
             )
-            self._checkin_reward_units = money_to_units(
-                config.get("checkin_reward", "0.05")
+            self._checkin_reward_min_units = money_to_units(
+                config.get("checkin_reward_min", "0.01")
+            )
+            self._checkin_reward_max_units = money_to_units(
+                config.get("checkin_reward_max", "0.10")
             )
             self._checkin_daily_budget_units = money_to_units(
                 config.get("checkin_daily_budget", "10.00")
@@ -121,8 +124,15 @@ class FapiPlugin(Star):
             self._red_packet_expire_minutes = int(
                 config.get("red_packet_expire_minutes", 60)
             )
-            if self._checkin_daily_budget_units < self._checkin_reward_units:
-                raise ValueError("签到每日预算不能小于单次签到奖励")
+            if self._checkin_reward_max_units < self._checkin_reward_min_units:
+                raise ValueError("签到奖励最大值不能小于最小值")
+            if (
+                self._checkin_reward_min_units % MIN_RED_PACKET_UNITS != 0
+                or self._checkin_reward_max_units % MIN_RED_PACKET_UNITS != 0
+            ):
+                raise ValueError("签到奖励必须使用 0.01 的整数倍")
+            if self._checkin_daily_budget_units < self._checkin_reward_min_units:
+                raise ValueError("签到每日预算不能小于签到奖励最小值")
             if not 1 <= self._red_packet_max_count <= 1000:
                 raise ValueError("红包最大份数必须在 1 到 1000 之间")
             if not 1 <= self._red_packet_expire_minutes <= 1440:
@@ -390,7 +400,8 @@ class FapiPlugin(Star):
                 qq_id=qq_id,
                 tokenrouter_user_id=binding.tokenrouter_user_id,
                 reward_date=reward_date,
-                amount_units=self._checkin_reward_units,
+                minimum_amount_units=self._checkin_reward_min_units,
+                maximum_amount_units=self._checkin_reward_max_units,
                 daily_budget_units=self._checkin_daily_budget_units,
             )
         except RewardBudgetExhausted:

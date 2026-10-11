@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - AstrBot 安装依赖后不会走此分
 
 MONEY_SCALE = 100_000_000
 MIN_RED_PACKET_UNITS = 1_000_000  # $0.01
+CHECKIN_REWARD_STEP_UNITS = 1_000_000  # USD 0.01
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 _PLATFORM_ID_MAX_LENGTH = 128
 
@@ -105,6 +106,26 @@ def money_to_units(value: Any, *, allow_zero: bool = False) -> int:
 
 def units_to_decimal(units: int) -> Decimal:
     return Decimal(units) / Decimal(MONEY_SCALE)
+
+
+def random_checkin_reward_units(
+    minimum_units: int,
+    maximum_units: int,
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> int:
+    if minimum_units <= 0:
+        raise ValueError("签到奖励最小值必须大于 0")
+    if maximum_units < minimum_units:
+        raise ValueError("签到奖励最大值不能小于最小值")
+    if minimum_units % CHECKIN_REWARD_STEP_UNITS != 0:
+        raise ValueError("签到奖励最小值必须使用 0.01 的整数倍")
+
+    maximum_units -= maximum_units % CHECKIN_REWARD_STEP_UNITS
+    choices = (
+        (maximum_units - minimum_units) // CHECKIN_REWARD_STEP_UNITS
+    ) + 1
+    return minimum_units + randbelow(choices) * CHECKIN_REWARD_STEP_UNITS
 
 
 def split_red_packet_share(
@@ -212,7 +233,8 @@ class MySQLRewardStore:
         qq_id: str,
         tokenrouter_user_id: int,
         reward_date: date,
-        amount_units: int,
+        minimum_amount_units: int,
+        maximum_amount_units: int,
         daily_budget_units: int,
     ) -> CheckinReservation:
         await self.initialize()
@@ -232,9 +254,14 @@ class MySQLRewardStore:
 
                 budget = await self._get_budget(connection, reward_date)
                 reserved = int(budget["checkin_reserved_units"])
-                if reserved + amount_units > daily_budget_units:
+                remaining_budget_units = daily_budget_units - reserved
+                if remaining_budget_units < minimum_amount_units:
                     await connection.rollback()
                     raise RewardBudgetExhausted("今日签到奖励预算已发完")
+                amount_units = random_checkin_reward_units(
+                    minimum_amount_units,
+                    min(maximum_amount_units, remaining_budget_units),
+                )
 
                 previous_date = reward_date - timedelta(days=1)
                 previous_streak = await self._previous_checkin_streak(

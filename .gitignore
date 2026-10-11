@@ -4,4 +4,6 @@ __pycache__/
 .ruff_cache/
 .venv/
 .backup-*/
+.release_auth/
+.release_repo/
 astrbot_plugin_fapi.zip

@@ -682,6 +682,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         class Rewards:
             async def reserve_checkin(_self, **values):
                 self.assertEqual(values["tokenrouter_user_id"], 73)
+                self.assertEqual(values["minimum_amount_units"], 1_000_000)
+                self.assertEqual(values["maximum_amount_units"], 10_000_000)
                 return self.module.CheckinReservation(
                     job=job,
                     reward_date=values["reward_date"],
