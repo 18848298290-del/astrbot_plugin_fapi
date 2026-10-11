@@ -44,6 +44,7 @@ from .tokenrouter_client import (
 
 
 _SUPPORTED_QQ_PLATFORMS = frozenset({"aiocqhttp", "qq_official"})
+_GAME_REFUND_MAX_ATTEMPTS = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,17 +58,54 @@ class GroupCommandContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和余额游戏",
-    "3.3.0",
+    "3.3.1",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self._allowed_group_id = str(config.get("allowed_group_id", "")).strip()
+        table_names = {
+            "mysql_table": str(
+                config.get("mysql_table", "astrbot_fapi_bindings")
+            ).strip(),
+            "mysql_reward_jobs_table": str(
+                config.get("mysql_reward_jobs_table", "astrbot_fapi_reward_jobs")
+            ).strip(),
+            "mysql_checkins_table": str(
+                config.get("mysql_checkins_table", "astrbot_fapi_checkins")
+            ).strip(),
+            "mysql_red_packets_table": str(
+                config.get("mysql_red_packets_table", "astrbot_fapi_red_packets")
+            ).strip(),
+            "mysql_red_claims_table": str(
+                config.get("mysql_red_claims_table", "astrbot_fapi_red_claims")
+            ).strip(),
+            "mysql_reward_budgets_table": str(
+                config.get(
+                    "mysql_reward_budgets_table",
+                    "astrbot_fapi_reward_budgets",
+                )
+            ).strip(),
+            "mysql_game_operations_table": str(
+                config.get(
+                    "mysql_game_operations_table",
+                    "astrbot_fapi_game_operations",
+                )
+            ).strip(),
+            "mysql_game_cooldowns_table": str(
+                config.get(
+                    "mysql_game_cooldowns_table",
+                    "astrbot_fapi_game_cooldowns",
+                )
+            ).strip(),
+        }
+        self._validate_unique_table_names(table_names)
+        request_timeout = float(config.get("request_timeout", 10))
         self.client = TokenRouterClient(
             base_url=str(config.get("tokenrouter_url", "")),
             admin_api_key=str(config.get("admin_api_key", "")),
-            timeout=float(config.get("request_timeout", 10)),
+            timeout=request_timeout,
             verify_ssl=bool(config.get("verify_ssl", True)),
         )
         self.bindings = MySQLBindingStore(
@@ -76,7 +114,7 @@ class FapiPlugin(Star):
             user=str(config.get("mysql_user", "")),
             password=str(config.get("mysql_password", "")),
             database=str(config.get("mysql_database", "")),
-            table=str(config.get("mysql_table", "astrbot_fapi_bindings")),
+            table=table_names["mysql_table"],
             connect_timeout=int(config.get("mysql_connect_timeout", 10)),
             ssl_enabled=bool(config.get("mysql_ssl_enabled", True)),
             ssl_verify=bool(config.get("mysql_ssl_verify", True)),
@@ -93,36 +131,26 @@ class FapiPlugin(Star):
         }
         self.rewards = MySQLRewardStore(
             **mysql_options,
-            jobs_table=str(
-                config.get("mysql_reward_jobs_table", "astrbot_fapi_reward_jobs")
-            ),
-            checkins_table=str(
-                config.get("mysql_checkins_table", "astrbot_fapi_checkins")
-            ),
-            packets_table=str(
-                config.get("mysql_red_packets_table", "astrbot_fapi_red_packets")
-            ),
-            claims_table=str(
-                config.get("mysql_red_claims_table", "astrbot_fapi_red_claims")
-            ),
-            budgets_table=str(
-                config.get("mysql_reward_budgets_table", "astrbot_fapi_reward_budgets")
-            ),
+            jobs_table=table_names["mysql_reward_jobs_table"],
+            checkins_table=table_names["mysql_checkins_table"],
+            packets_table=table_names["mysql_red_packets_table"],
+            claims_table=table_names["mysql_red_claims_table"],
+            budgets_table=table_names["mysql_reward_budgets_table"],
         )
         self.games = MySQLGameStore(
             **mysql_options,
-            table=str(
-                config.get(
-                    "mysql_game_operations_table",
-                    "astrbot_fapi_game_operations",
-                )
-            ),
+            table=table_names["mysql_game_operations_table"],
+            cooldown_table=table_names["mysql_game_cooldowns_table"],
         )
         self._reward_delivery_lock = asyncio.Lock()
         self._reward_worker_task: asyncio.Task | None = None
         self._game_command_lock = asyncio.Lock()
         self._game_delivery_lock = asyncio.Lock()
         self._game_worker_task: asyncio.Task | None = None
+        self._game_claim_lease_seconds = max(
+            180,
+            min(3600, math.ceil(request_timeout) * 4 + 60),
+        )
         self._reward_config_error = ""
         self._game_config_error = ""
         try:
@@ -212,22 +240,11 @@ class FapiPlugin(Star):
             await self.rewards.initialize()
         except RewardDatabaseError as exc:
             logger.error("FAPI 奖励数据表初始化失败：%s", exc)
-        else:
-            if not self._reward_config_error:
-                self._reward_worker_task = asyncio.create_task(
-                    self._reward_worker_loop(),
-                    name="fapi-reward-worker",
-                )
         try:
             await self.games.initialize()
         except GameDatabaseError as exc:
             logger.error("FAPI 游戏数据表初始化失败：%s", exc)
-        else:
-            if not self._game_config_error:
-                self._game_worker_task = asyncio.create_task(
-                    self._game_worker_loop(),
-                    name="fapi-game-worker",
-                )
+        self._ensure_background_workers()
 
     @filter.command_group("fapi")
     def fapi(self):
@@ -851,20 +868,33 @@ class FapiPlugin(Star):
         yield event.plain_result(self._game_reply(settled))
 
     async def terminate(self) -> None:
-        if self._game_worker_task is not None:
-            self._game_worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._game_worker_task
-            self._game_worker_task = None
-        if self._reward_worker_task is not None:
-            self._reward_worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._reward_worker_task
-            self._reward_worker_task = None
-        await self.games.close()
-        await self.rewards.close()
-        await self.bindings.close()
-        await self.client.close()
+        for attribute, task_name in (
+            ("_game_worker_task", "游戏结算"),
+            ("_reward_worker_task", "奖励补发"),
+        ):
+            task = getattr(self, attribute)
+            if task is None:
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("FAPI %s后台任务停止失败", task_name)
+            finally:
+                setattr(self, attribute, None)
+
+        for resource_name, resource in (
+            ("游戏数据库", self.games),
+            ("奖励数据库", self.rewards),
+            ("绑定数据库", self.bindings),
+            ("TokenRouter 客户端", self.client),
+        ):
+            try:
+                await resource.close()
+            except Exception:
+                logger.exception("FAPI 关闭%s失败", resource_name)
 
     async def _deliver_reward(self, job: RewardJob) -> bool:
         async with self._reward_delivery_lock:
@@ -944,16 +974,31 @@ class FapiPlugin(Star):
     async def _settle_game_operation(
         self,
         operation: GameOperation,
+        *,
+        already_claimed: bool = False,
     ) -> GameOperation:
         async with self._game_delivery_lock:
             try:
-                current = await self.games.get(operation.operation_id)
+                current = (
+                    operation
+                    if already_claimed
+                    else await self.games.claim(
+                        operation.operation_id,
+                        lease_seconds=self._game_claim_lease_seconds,
+                    )
+                )
             except GameDatabaseError as exc:
-                logger.error("FAPI 读取游戏结算任务失败：%s", exc)
+                logger.error("FAPI 领取游戏结算任务失败：%s", exc)
                 return operation
             if current is None:
-                logger.error("FAPI 游戏结算任务不存在：%s", operation.operation_id)
-                return operation
+                return await self._reload_game(operation)
+            claim_token = current.lease_token
+            if not claim_token:
+                logger.error(
+                    "FAPI 游戏结算任务缺少数据库租约：operation=%s",
+                    current.operation_id,
+                )
+                return await self._reload_game(current)
 
             for _ in range(3):
                 if current.status not in {
@@ -962,6 +1007,20 @@ class FapiPlugin(Star):
                     GameStatus.PENDING_REFUND,
                 }:
                     return current
+
+                try:
+                    current = await self.games.renew_claim(
+                        current.operation_id,
+                        claim_token,
+                        lease_seconds=self._game_claim_lease_seconds,
+                    )
+                except GameDatabaseError as exc:
+                    logger.warning(
+                        "FAPI 游戏结算租约已失效：operation=%s, error=%s",
+                        current.operation_id,
+                        exc,
+                    )
+                    return await self._reload_game(current)
 
                 if current.status == GameStatus.PENDING_DEBIT:
                     user_id = current.debit_user_id
@@ -974,7 +1033,11 @@ class FapiPlugin(Star):
                             "FAPI 游戏派奖任务缺少收款用户：operation=%s",
                             current.operation_id,
                         )
-                        await self.games.mark_pending_refund(current.operation_id)
+                        await self.games.mark_pending_refund(
+                            current.operation_id,
+                            claim_token=claim_token,
+                            lease_seconds=self._game_claim_lease_seconds,
+                        )
                         current = await self._reload_game(current)
                         continue
                     user_id = current.credit_user_id
@@ -1012,18 +1075,43 @@ class FapiPlugin(Star):
                     )
                     try:
                         if phase == "debit" and is_insufficient_balance_error(exc):
-                            await self.games.mark_insufficient(current.operation_id)
+                            await self.games.mark_insufficient(
+                                current.operation_id,
+                                claim_token=claim_token,
+                            )
                         elif phase == "debit" and not self._retryable_game_error(exc):
-                            await self.games.mark_failed(current.operation_id)
+                            await self.games.mark_failed(
+                                current.operation_id,
+                                claim_token=claim_token,
+                            )
                         elif phase == "credit" and not self._retryable_game_error(exc):
-                            await self.games.mark_pending_refund(current.operation_id)
+                            await self.games.mark_pending_refund(
+                                current.operation_id,
+                                claim_token=claim_token,
+                                lease_seconds=self._game_claim_lease_seconds,
+                            )
                             current = await self._reload_game(current)
                             continue
+                        elif phase == "refund" and not self._retryable_game_error(exc):
+                            status = await self.games.record_refund_error(
+                                current.operation_id,
+                                str(exc),
+                                max_attempts=_GAME_REFUND_MAX_ATTEMPTS,
+                                base_delay_seconds=self._game_retry_delay(exc),
+                                claim_token=claim_token,
+                            )
+                            if status == GameStatus.MANUAL_REVIEW:
+                                logger.error(
+                                    "FAPI 游戏退款已转人工处理：operation=%s, error=%s",
+                                    current.operation_id,
+                                    exc,
+                                )
                         else:
                             await self.games.record_error(
                                 current.operation_id,
                                 str(exc),
                                 base_delay_seconds=self._game_retry_delay(exc),
+                                claim_token=claim_token,
                             )
                     except GameDatabaseError as store_exc:
                         logger.error("FAPI 记录游戏结算错误失败：%s", store_exc)
@@ -1034,16 +1122,27 @@ class FapiPlugin(Star):
                         await self.games.record_error(
                             current.operation_id,
                             str(exc),
+                            claim_token=claim_token,
                         )
                     return await self._reload_game(current)
 
                 try:
                     if phase == "debit":
-                        await self.games.mark_debited(current.operation_id)
+                        await self.games.mark_debited(
+                            current.operation_id,
+                            claim_token=claim_token,
+                            lease_seconds=self._game_claim_lease_seconds,
+                        )
                     elif phase == "credit":
-                        await self.games.mark_succeeded(current.operation_id)
+                        await self.games.mark_succeeded(
+                            current.operation_id,
+                            claim_token=claim_token,
+                        )
                     else:
-                        await self.games.mark_refunded(current.operation_id)
+                        await self.games.mark_refunded(
+                            current.operation_id,
+                            claim_token=claim_token,
+                        )
                 except GameDatabaseError:
                     # 远端写入使用固定幂等键；保留旧状态后重试可安全补齐。
                     logger.exception(
@@ -1065,14 +1164,47 @@ class FapiPlugin(Star):
     async def _game_worker_loop(self) -> None:
         while True:
             try:
-                operations = await self.games.list_pending()
+                operations = await self.games.claim_pending(
+                    lease_seconds=self._game_claim_lease_seconds,
+                )
                 for operation in operations:
-                    await self._settle_game_operation(operation)
+                    await self._settle_game_operation(
+                        operation,
+                        already_claimed=True,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("FAPI 游戏结算补偿任务执行失败")
             await asyncio.sleep(15)
+
+    def _ensure_background_workers(self) -> None:
+        if self._reward_worker_task is None or self._reward_worker_task.done():
+            self._reward_worker_task = asyncio.create_task(
+                self._reward_worker_loop(),
+                name="fapi-reward-worker",
+            )
+        if self._game_worker_task is None or self._game_worker_task.done():
+            self._game_worker_task = asyncio.create_task(
+                self._game_worker_loop(),
+                name="fapi-game-worker",
+            )
+
+    @staticmethod
+    def _validate_unique_table_names(table_names: dict[str, str]) -> None:
+        owners_by_name: dict[str, list[str]] = {}
+        display_names: dict[str, str] = {}
+        for option_name, table_name in table_names.items():
+            normalized = table_name.casefold()
+            owners_by_name.setdefault(normalized, []).append(option_name)
+            display_names.setdefault(normalized, table_name)
+        duplicates = [
+            f"{display_names[name]} ({', '.join(owners)})"
+            for name, owners in owners_by_name.items()
+            if len(owners) > 1
+        ]
+        if duplicates:
+            raise ValueError("MySQL 数据表名称必须互不相同：" + "；".join(duplicates))
 
     @staticmethod
     def _retryable_game_error(exc: TokenRouterError) -> bool:
@@ -1099,6 +1231,8 @@ class FapiPlugin(Star):
         if operation.game_type == "robbery":
             if operation.status in pending:
                 return "打劫结果已锁定，余额正在结算，请稍后查询。"
+            if operation.status == GameStatus.MANUAL_REVIEW:
+                return "打劫结算异常，退款需要管理员人工处理。"
             if operation.status == GameStatus.INSUFFICIENT:
                 return "对方余额不足，本次打劫未得手。"
             if operation.status == GameStatus.REFUNDED:
@@ -1115,6 +1249,8 @@ class FapiPlugin(Star):
 
         if operation.status in pending:
             return "老虎机结果已锁定，余额正在结算，请稍后查询。"
+        if operation.status == GameStatus.MANUAL_REVIEW:
+            return "老虎机结算异常，退款需要管理员人工处理。"
         if operation.status == GameStatus.INSUFFICIENT:
             return "余额不足，无法支付本次老虎机投入。"
         if operation.status == GameStatus.REFUNDED:
@@ -1318,7 +1454,12 @@ class FapiPlugin(Star):
                 ).strip()
                 if member_openid and mention_id and member_openid != mention_id:
                     return None
-                target_id = member_openid or mention_id
+                if member_openid:
+                    target_id = member_openid
+                elif is_you is False:
+                    target_id = mention_id
+                else:
+                    continue
                 if FapiPlugin._valid_platform_identifier(target_id):
                     candidates.add(target_id)
         else:

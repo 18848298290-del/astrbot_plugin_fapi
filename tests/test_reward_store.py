@@ -2,6 +2,8 @@ import math
 import unittest
 from datetime import date, datetime
 from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from reward_store import (
     CHECKIN_REWARD_STEP_UNITS,
@@ -98,6 +100,138 @@ class CheckinRewardTest(unittest.TestCase):
                 money_to_units("0.001"),
                 money_to_units("0.01"),
             )
+
+
+class RewardStoreDatabaseBehaviorTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def store():
+        return MySQLRewardStore(
+            host="db.example.com",
+            port=3306,
+            user="fapi",
+            password="secret",
+            database="astrbot",
+        )
+
+    async def test_initialize_sets_mysql_session_timezone_to_utc(self):
+        pool = SimpleNamespace()
+        create_pool = AsyncMock(return_value=pool)
+        store = self.store()
+        store._create_tables = AsyncMock()
+
+        with patch(
+            "reward_store.aiomysql",
+            SimpleNamespace(create_pool=create_pool, DictCursor=object()),
+        ):
+            await store.initialize()
+
+        self.assertEqual(
+            create_pool.await_args.kwargs["init_command"],
+            "SET time_zone = '+00:00'",
+        )
+        store._create_tables.assert_awaited_once_with()
+
+    async def test_pending_previous_checkin_preserves_streak(self):
+        class Cursor:
+            def __init__(self):
+                self.sql = ""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def execute(self, sql, _params=None):
+                self.sql = sql
+
+            async def fetchone(self):
+                return {"streak": 6}
+
+        cursor = Cursor()
+        connection = SimpleNamespace(cursor=lambda: cursor)
+
+        streak = await self.store()._previous_checkin_streak(
+            connection,
+            "member-openid",
+            date(2026, 10, 10),
+        )
+
+        self.assertEqual(streak, 6)
+        self.assertIn("status NOT IN ('failed', 'cancelled')", cursor.sql)
+        self.assertNotIn("status = 'succeeded'", cursor.sql)
+
+    async def test_existing_pending_checkin_counts_as_valid_day(self):
+        class Cursor:
+            def __init__(self):
+                self.sql = ""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def execute(self, sql, _params=None):
+                self.sql = sql
+
+            async def fetchone(self):
+                return {
+                    "operation_id": "operation-1",
+                    "reward_date": date(2026, 10, 11),
+                    "streak": 7,
+                    "source_type": "checkin",
+                    "qq_id": "member-openid",
+                    "tokenrouter_user_id": 42,
+                    "amount_units": MONEY_SCALE,
+                    "redeem_code": "FAPIR_ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                    "status": "pending",
+                    "attempt_count": 1,
+                    "first_attempt_at": datetime(2026, 10, 11, 0, 0, 0),
+                    "valid_days": 7,
+                }
+
+        cursor = Cursor()
+        connection = SimpleNamespace(cursor=lambda: cursor)
+
+        reservation = await self.store()._get_checkin(
+            connection,
+            "member-openid",
+            date(2026, 10, 11),
+            for_update=True,
+        )
+
+        self.assertIsNotNone(reservation)
+        self.assertEqual(reservation.streak, 7)
+        self.assertEqual(reservation.total_days, 7)
+        self.assertEqual(reservation.job.status.value, "pending")
+        self.assertIn("status NOT IN ('failed', 'cancelled')", cursor.sql)
+        self.assertTrue(cursor.sql.rstrip().endswith("FOR UPDATE"))
+
+    async def test_valid_checkin_count_excludes_terminal_failures(self):
+        class Cursor:
+            def __init__(self):
+                self.sql = ""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def execute(self, sql, _params=None):
+                self.sql = sql
+
+            async def fetchone(self):
+                return {"total": 4}
+
+        cursor = Cursor()
+        connection = SimpleNamespace(cursor=lambda: cursor)
+
+        total = await self.store()._valid_checkin_count(connection, "member-openid")
+
+        self.assertEqual(total, 4)
+        self.assertIn("status NOT IN ('failed', 'cancelled')", cursor.sql)
 
 
 class RedPacketSplitTest(unittest.TestCase):

@@ -207,6 +207,7 @@ class MySQLRewardStore:
                     maxsize=5,
                     connect_timeout=self.connect_timeout,
                     pool_recycle=1800,
+                    init_command="SET time_zone = '+00:00'",
                     cursorclass=aiomysql.DictCursor,
                     ssl=self._ssl_context(),
                 )
@@ -269,7 +270,7 @@ class MySQLRewardStore:
                     qq_id,
                     previous_date,
                 )
-                total_days = await self._successful_checkin_count(connection, qq_id)
+                total_days = await self._valid_checkin_count(connection, qq_id)
                 operation_id = str(uuid.uuid4())
                 redeem_code = _redeem_code(operation_id)
                 await self._insert_reward_job(
@@ -825,7 +826,8 @@ class MySQLRewardStore:
                    j.attempt_count, j.first_attempt_at,
                    (SELECT COUNT(*) FROM `{self.checkins_table}` c2
                     JOIN `{self.jobs_table}` j2 ON j2.operation_id = c2.operation_id
-                    WHERE c2.qq_id = c.qq_id AND j2.status = 'succeeded') AS paid_days
+                    WHERE c2.qq_id = c.qq_id
+                      AND j2.status NOT IN ('failed', 'cancelled')) AS valid_days
             FROM `{self.checkins_table}` c
             JOIN `{self.jobs_table}` j ON j.operation_id = c.operation_id
             WHERE c.qq_id = %s AND c.reward_date = %s
@@ -836,12 +838,12 @@ class MySQLRewardStore:
             row = await cursor.fetchone()
         if row is None:
             return None
-        paid_days = int(row.pop("paid_days"))
+        valid_days = int(row.pop("valid_days"))
         return CheckinReservation(
             job=_row_to_job(row),
             reward_date=row["reward_date"],
             streak=int(row["streak"]),
-            total_days=paid_days + (0 if row["status"] == "succeeded" else 1),
+            total_days=valid_days,
             created=False,
         )
 
@@ -854,7 +856,8 @@ class MySQLRewardStore:
         sql = f"""
             SELECT c.streak FROM `{self.checkins_table}` c
             JOIN `{self.jobs_table}` j ON j.operation_id = c.operation_id
-            WHERE c.qq_id = %s AND c.reward_date = %s AND j.status = 'succeeded'
+            WHERE c.qq_id = %s AND c.reward_date = %s
+              AND j.status NOT IN ('failed', 'cancelled')
             LIMIT 1
         """
         async with connection.cursor() as cursor:
@@ -862,11 +865,11 @@ class MySQLRewardStore:
             row = await cursor.fetchone()
         return int(row["streak"]) if row else 0
 
-    async def _successful_checkin_count(self, connection: Any, qq_id: str) -> int:
+    async def _valid_checkin_count(self, connection: Any, qq_id: str) -> int:
         sql = f"""
             SELECT COUNT(*) AS total FROM `{self.checkins_table}` c
             JOIN `{self.jobs_table}` j ON j.operation_id = c.operation_id
-            WHERE c.qq_id = %s AND j.status = 'succeeded'
+            WHERE c.qq_id = %s AND j.status NOT IN ('failed', 'cancelled')
         """
         async with connection.cursor() as cursor:
             await cursor.execute(sql, (qq_id,))

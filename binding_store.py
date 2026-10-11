@@ -111,6 +111,7 @@ class MySQLBindingStore:
                     pool_recycle=1800,
                     cursorclass=aiomysql.DictCursor,
                     ssl=self._ssl_context(),
+                    init_command="SET time_zone = '+00:00'",
                 )
                 await self._create_table()
             except Exception as exc:

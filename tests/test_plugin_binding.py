@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import logging
 import sys
@@ -231,7 +232,26 @@ class InMemoryGameStore:
             return None
         return self.operation
 
-    async def mark_debited(self, operation_id):
+    async def claim(self, operation_id, **_values):
+        operation = await self.get(operation_id)
+        if operation is None:
+            return None
+        self.operation = replace(operation, lease_token="test-game-lease")
+        return self.operation
+
+    async def renew_claim(self, operation_id, claim_token, **_values):
+        operation = await self.get(operation_id)
+        if operation is None or operation.lease_token != claim_token:
+            raise self.module.GameOperationConflict("stale test claim")
+        return operation
+
+    async def claim_pending(self, **_values):
+        if self.operation is None:
+            return []
+        claimed = await self.claim(self.operation.operation_id)
+        return [claimed] if claimed is not None else []
+
+    async def mark_debited(self, operation_id, **_values):
         self.transition_calls.append(("debited", operation_id))
         status = (
             self.module.GameStatus.PENDING_CREDIT
@@ -240,35 +260,35 @@ class InMemoryGameStore:
         )
         self.operation = replace(self.operation, status=status)
 
-    async def mark_succeeded(self, operation_id):
+    async def mark_succeeded(self, operation_id, **_values):
         self.transition_calls.append(("succeeded", operation_id))
         self.operation = replace(
             self.operation,
             status=self.module.GameStatus.SUCCEEDED,
         )
 
-    async def mark_insufficient(self, operation_id):
+    async def mark_insufficient(self, operation_id, **_values):
         self.transition_calls.append(("insufficient", operation_id))
         self.operation = replace(
             self.operation,
             status=self.module.GameStatus.INSUFFICIENT,
         )
 
-    async def mark_failed(self, operation_id):
+    async def mark_failed(self, operation_id, **_values):
         self.transition_calls.append(("failed", operation_id))
         self.operation = replace(
             self.operation,
             status=self.module.GameStatus.FAILED,
         )
 
-    async def mark_pending_refund(self, operation_id):
+    async def mark_pending_refund(self, operation_id, **_values):
         self.transition_calls.append(("pending_refund", operation_id))
         self.operation = replace(
             self.operation,
             status=self.module.GameStatus.PENDING_REFUND,
         )
 
-    async def mark_refunded(self, operation_id):
+    async def mark_refunded(self, operation_id, **_values):
         self.transition_calls.append(("refunded", operation_id))
         self.operation = replace(
             self.operation,
@@ -277,6 +297,10 @@ class InMemoryGameStore:
 
     async def record_error(self, operation_id, error, **values):
         self.transition_calls.append(("error", operation_id, error, values))
+
+    async def record_refund_error(self, operation_id, error, **values):
+        self.transition_calls.append(("refund_error", operation_id, error, values))
+        return self.operation.status
 
 
 class GameBindings:
@@ -326,6 +350,111 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(replies), 1)
         self.assertIn("/fapi 绑定 <用户名>", replies[0])
+
+    async def test_constructor_rejects_duplicate_table_names_case_insensitively(self):
+        with self.assertRaisesRegex(ValueError, "MySQL 数据表名称必须互不相同"):
+            self.module.FapiPlugin(
+                object(),
+                {
+                    "mysql_table": "Shared_Table",
+                    "mysql_game_operations_table": " shared_table ",
+                },
+            )
+
+    async def test_constructor_includes_game_cooldown_table_in_uniqueness(self):
+        with self.assertRaisesRegex(ValueError, "mysql_game_cooldowns_table"):
+            self.module.FapiPlugin(
+                object(),
+                {
+                    "mysql_table": "astrbot_fapi_game_cooldowns",
+                },
+            )
+
+    async def test_game_lease_covers_all_http_timeout_phases(self):
+        plugin = self.module.FapiPlugin(
+            object(),
+            {"request_timeout": 60},
+        )
+        await plugin.client.close()
+
+        self.assertEqual(plugin._game_claim_lease_seconds, 300)
+
+    async def test_initialize_starts_supervisors_after_database_failure(self):
+        started = []
+        closed = []
+        wait_forever = self.module.asyncio.Event()
+
+        class FailingStore:
+            def __init__(store_self, error_type, name):
+                store_self.error_type = error_type
+                store_self.name = name
+
+            async def initialize(store_self):
+                raise store_self.error_type("database unavailable")
+
+            async def close(store_self):
+                closed.append(store_self.name)
+
+        class Client:
+            async def close(_self):
+                closed.append("client")
+
+        async def reward_worker():
+            started.append("reward")
+            await wait_forever.wait()
+
+        async def game_worker():
+            started.append("game")
+            await wait_forever.wait()
+
+        self.plugin.bindings = FailingStore(
+            self.module.BindingDatabaseError,
+            "bindings",
+        )
+        self.plugin.rewards = FailingStore(
+            self.module.RewardDatabaseError,
+            "rewards",
+        )
+        self.plugin.games = FailingStore(
+            self.module.GameDatabaseError,
+            "games",
+        )
+        self.plugin.client = Client()
+        self.plugin._game_config_error = "invalid new-game settings"
+        self.plugin._reward_worker_loop = reward_worker
+        self.plugin._game_worker_loop = game_worker
+
+        await self.plugin.initialize()
+        await self.module.asyncio.sleep(0)
+
+        self.assertCountEqual(started, ["reward", "game"])
+        self.assertIsNotNone(self.plugin._reward_worker_task)
+        self.assertIsNotNone(self.plugin._game_worker_task)
+
+        await self.plugin.terminate()
+        self.assertCountEqual(closed, ["games", "rewards", "bindings", "client"])
+
+    async def test_terminate_closes_remaining_resources_after_one_close_fails(self):
+        closed = []
+
+        class Resource:
+            def __init__(resource_self, name, fail=False):
+                resource_self.name = name
+                resource_self.fail = fail
+
+            async def close(resource_self):
+                closed.append(resource_self.name)
+                if resource_self.fail:
+                    raise RuntimeError("close failed")
+
+        self.plugin.games = Resource("games", fail=True)
+        self.plugin.rewards = Resource("rewards")
+        self.plugin.bindings = Resource("bindings")
+        self.plugin.client = Resource("client")
+
+        await self.plugin.terminate()
+
+        self.assertEqual(closed, ["games", "rewards", "bindings", "client"])
 
     async def test_onebot_help_menu_lists_commands_and_permissions(self):
         replies = await collect(self.plugin.help_menu(FakeEvent()))
@@ -654,6 +783,49 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             self.plugin._mentioned_target_id(event, command_context)
         )
 
+    async def test_official_mention_id_fallback_requires_explicit_non_bot(self):
+        self.plugin._allowed_group_id = "official-group-openid"
+        base_values = {
+            "sender_id": "actor-member-openid",
+            "platform_name": "qq_official",
+            "group_id": "official-group-openid",
+        }
+        explicit_target = FakeEvent(
+            **base_values,
+            raw_message={
+                "mentions": [
+                    {"id": "target-member-openid", "is_you": False},
+                ]
+            },
+        )
+        ambiguous_target = FakeEvent(
+            **base_values,
+            raw_message={"mentions": [{"id": "ambiguous-openid"}]},
+        )
+        bot_and_target = FakeEvent(
+            **base_values,
+            raw_message={
+                "mentions": [
+                    {"id": "bot-or-unknown-openid"},
+                    {"id": "target-member-openid", "is_you": False},
+                ]
+            },
+        )
+        command_context, error = self.plugin._group_command_context(explicit_target)
+
+        self.assertIsNone(error)
+        self.assertEqual(
+            self.plugin._mentioned_target_id(explicit_target, command_context),
+            "target-member-openid",
+        )
+        self.assertIsNone(
+            self.plugin._mentioned_target_id(ambiguous_target, command_context)
+        )
+        self.assertEqual(
+            self.plugin._mentioned_target_id(bot_and_target, command_context),
+            "target-member-openid",
+        )
+
     async def test_official_mention_ignores_bot_and_rejects_multiple_targets(self):
         self.plugin._allowed_group_id = "official-group-openid"
         base_values = {
@@ -959,10 +1131,97 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
                     "error",
                     "game-op-1",
                     "rate limited",
-                    {"base_delay_seconds": 13},
+                    {
+                        "base_delay_seconds": 13,
+                        "claim_token": "test-game-lease",
+                    },
                 )
             ],
         )
+
+    async def test_game_settlement_does_not_run_without_database_claim(self):
+        operation = game_operation(
+            self.module,
+            status=self.module.GameStatus.PENDING_DEBIT,
+        )
+        games = InMemoryGameStore(self.module, operation=operation)
+
+        async def claim_unavailable(_operation_id, **_values):
+            return None
+
+        games.claim = claim_unavailable
+        client = BalanceClient(self.module)
+        self.plugin.games = games
+        self.plugin.client = client
+
+        settled = await self.plugin._settle_game_operation(operation)
+
+        self.assertEqual(settled.status, self.module.GameStatus.PENDING_DEBIT)
+        self.assertEqual(client.calls, [])
+
+    async def test_permanent_refund_error_uses_bounded_manual_review_path(self):
+        operation = game_operation(
+            self.module,
+            status=self.module.GameStatus.PENDING_REFUND,
+        )
+        games = InMemoryGameStore(self.module, operation=operation)
+
+        class Client:
+            async def adjust_balance(_self, **_values):
+                raise self.module.TokenRouterError(
+                    "refund rejected",
+                    status_code=403,
+                    api_code="FORBIDDEN",
+                )
+
+        self.plugin.games = games
+        self.plugin.client = Client()
+
+        await self.plugin._settle_game_operation(operation)
+
+        self.assertEqual(games.transition_calls[0][0], "refund_error")
+        self.assertEqual(
+            games.transition_calls[0][3],
+            {
+                "max_attempts": 5,
+                "base_delay_seconds": 5,
+                "claim_token": "test-game-lease",
+            },
+        )
+        self.assertEqual(
+            self.plugin._game_reply(
+                replace(operation, status=self.module.GameStatus.MANUAL_REVIEW)
+            ),
+            "打劫结算异常，退款需要管理员人工处理。",
+        )
+
+    async def test_game_worker_settles_only_claimed_operations(self):
+        operation = replace(
+            game_operation(
+                self.module,
+                status=self.module.GameStatus.PENDING_DEBIT,
+            ),
+            lease_token="worker-lease",
+        )
+        calls = []
+
+        class Store:
+            async def claim_pending(_self, **values):
+                calls.append(("claim_pending", values))
+                return [operation]
+
+        async def settle(_operation, *, already_claimed=False):
+            calls.append(("settle", already_claimed))
+            raise asyncio.CancelledError
+
+        self.plugin.games = Store()
+        self.plugin._settle_game_operation = settle
+
+        with self.assertRaises(asyncio.CancelledError):
+            await self.plugin._game_worker_loop()
+
+        self.assertEqual(calls[0][0], "claim_pending")
+        self.assertEqual(calls[1], ("settle", True))
 
     async def test_binds_exact_username_with_sender_qq_email(self):
         calls = []

@@ -1,5 +1,8 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
+import binding_store
 from binding_store import BindStatus, MySQLBindingStore, classify_existing_bindings
 
 
@@ -46,6 +49,33 @@ class MySQLConfigTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(Exception, "表名不合法"):
             store._validate_config()
+
+
+class MySQLInitializationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_connection_pool_uses_utc_session_timezone(self):
+        store = MySQLBindingStore(
+            host="db.example.com",
+            port=3306,
+            user="fapi",
+            password="secret",
+            database="astrbot",
+            ssl_enabled=False,
+        )
+        pool = AsyncMock()
+        store._create_table = AsyncMock()
+        create_pool = AsyncMock(return_value=pool)
+
+        with patch.object(
+            binding_store,
+            "aiomysql",
+            SimpleNamespace(create_pool=create_pool, DictCursor=object()),
+        ):
+            await store.initialize()
+
+        self.assertEqual(
+            create_pool.await_args.kwargs["init_command"],
+            "SET time_zone = '+00:00'",
+        )
 
 
 class PlatformIdMigrationTest(unittest.IsolatedAsyncioTestCase):

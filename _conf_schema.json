@@ -208,5 +208,11 @@
     "type": "string",
     "hint": "用于游戏幂等扣款、派奖、退款和故障重试。",
     "default": "astrbot_fapi_game_operations"
+  },
+  "mysql_game_cooldowns_table": {
+    "description": "游戏冷却记录表名",
+    "type": "string",
+    "hint": "用于跨进程原子限制同一用户的游戏冷却；必须与其他插件表名不同。",
+    "default": "astrbot_fapi_game_cooldowns"
   }
 }
