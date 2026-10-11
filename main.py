@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
+import inspect
 import math
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -39,6 +40,7 @@ from .reward_store import (
 from .tokenrouter_client import (
     TokenRouterClient,
     TokenRouterError,
+    TokenRouterUser,
     is_insufficient_balance_error,
 )
 
@@ -55,17 +57,34 @@ class GroupCommandContext:
     group_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class PrivateAdminContext:
+    platform: str
+    sender_id: str
+
+
 @register(
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和余额游戏",
-    "3.5.1",
+    "3.6.0",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self._allowed_group_id = str(config.get("allowed_group_id", "")).strip()
+        self._admin_private_enabled = bool(
+            config.get("admin_private_enabled", True)
+        )
+        self._admin_config_error = ""
+        try:
+            self._admin_balance_adjustment_max_units = money_to_units(
+                config.get("admin_balance_adjustment_max", "1000.00")
+            )
+        except ValueError as exc:
+            self._admin_config_error = str(exc)
+            self._admin_balance_adjustment_max_units = 0
         table_names = {
             "mysql_table": str(
                 config.get("mysql_table", "astrbot_fapi_bindings")
@@ -264,6 +283,181 @@ class FapiPlugin(Star):
     @filter.command_group("fapi")
     def fapi(self):
         """FAPI 中转站账号绑定。"""
+
+    @fapi.command("管理", alias={"admin"})
+    async def admin_private(
+        self,
+        event: AstrMessageEvent,
+        action: str = "",
+        username: str = "",
+        amount: str = "",
+    ):
+        """在私聊中执行受限的中转站管理操作。"""
+        admin_context, context_error = await self._private_admin_context(event)
+        if context_error:
+            yield event.plain_result(context_error)
+            return
+        assert admin_context is not None
+        if not self._admin_private_enabled:
+            yield event.plain_result("管理员私聊功能当前未开启。")
+            return
+
+        normalized_action = action.strip().casefold()
+        if normalized_action in {"", "帮助", "菜单", "help"}:
+            adjustment_limit = (
+                "配置错误"
+                if self._admin_config_error
+                else self._format_units(self._admin_balance_adjustment_max_units)
+            )
+            yield event.plain_result(
+                "FAPI 管理员私聊菜单\n"
+                "/fapi 管理 查询 <用户名>\n"
+                "/fapi 管理 加余额 <用户名> <金额>\n"
+                "/fapi 管理 减余额 <用户名> <金额>\n\n"
+                "用户名必须完全一致；余额操作单次上限："
+                f"{adjustment_limit}"
+            )
+            return
+
+        action_aliases = {
+            "查询": "query",
+            "用户": "query",
+            "query": "query",
+            "user": "query",
+            "加余额": "add",
+            "增加余额": "add",
+            "add": "add",
+            "减余额": "subtract",
+            "扣余额": "subtract",
+            "subtract": "subtract",
+            "sub": "subtract",
+        }
+        operation = action_aliases.get(normalized_action)
+        if operation is None:
+            yield event.plain_result("未知管理操作，请发送 /fapi 管理。")
+            return
+
+        amount_units = 0
+        idempotency_key = ""
+        if operation != "query":
+            if self._admin_config_error:
+                yield event.plain_result("管理员余额配置不正确，请检查插件配置。")
+                return
+            try:
+                amount_units = money_to_units(amount)
+            except ValueError as exc:
+                yield event.plain_result(f"金额不正确：{exc}")
+                return
+            if amount_units > self._admin_balance_adjustment_max_units:
+                yield event.plain_result(
+                    "单次余额调整不能超过 "
+                    f"{self._format_units(self._admin_balance_adjustment_max_units)}。"
+                )
+                return
+
+            idempotency_key = self._admin_balance_operation_key(
+                event,
+                admin_context,
+                operation,
+            ) or ""
+            if not idempotency_key:
+                yield event.plain_result(
+                    "无法确认当前消息编号，为避免重复调账，本次操作已取消。"
+                )
+                return
+
+        user, user_error = await self._resolve_private_admin_user(username)
+        if user_error:
+            yield event.plain_result(user_error)
+            return
+        assert user is not None
+
+        if operation == "query":
+            try:
+                summary = await self.client.get_balance_summary(user.user_id)
+            except TokenRouterError as exc:
+                logger.warning(
+                    "FAPI 管理员查询用户失败：status=%s, code=%s, error=%s",
+                    exc.status_code,
+                    exc.api_code,
+                    exc,
+                )
+                yield event.plain_result(self._api_error_reply(exc))
+                return
+            except Exception:
+                logger.exception("FAPI 管理员查询用户出现未预期错误")
+                yield event.plain_result("管理员查询服务暂时不可用，请稍后重试。")
+                return
+
+            yield event.plain_result(
+                "中转站用户\n"
+                f"ID：{user.user_id}\n"
+                f"用户名：{self._safe_reply_field(user.username)}\n"
+                f"邮箱：{self._safe_reply_field(user.email)}\n"
+                f"状态：{self._safe_reply_field(user.status or '未知')}\n"
+                f"余额：{self._format_usd(summary.balance)}\n"
+                f"已使用（近30天）：{self._format_usd(summary.used_last_30_days)}\n"
+                f"并发上限：{summary.concurrency}"
+            )
+            return
+
+        try:
+            result = await self.client.adjust_balance(
+                user_id=user.user_id,
+                amount=units_to_decimal(amount_units),
+                operation=operation,
+                idempotency_key=idempotency_key,
+                notes=(
+                    "FAPI private admin balance adjustment by "
+                    f"{admin_context.sender_id}"
+                ),
+            )
+        except TokenRouterError as exc:
+            logger.warning(
+                "FAPI 管理员余额调整失败：user=%s, operation=%s, "
+                "amount_units=%s, idempotency_key=%s, status=%s, code=%s, "
+                "unknown=%s, error=%s",
+                user.user_id,
+                operation,
+                amount_units,
+                idempotency_key,
+                exc.status_code,
+                exc.api_code,
+                exc.outcome_unknown,
+                exc,
+            )
+            if exc.outcome_unknown:
+                yield event.plain_result(
+                    "余额调整结果暂时无法确认。请先查询该用户余额，"
+                    "不要重复发送调账命令。"
+                )
+            elif operation == "subtract" and is_insufficient_balance_error(exc):
+                yield event.plain_result("用户余额不足，本次未扣减。")
+            else:
+                yield event.plain_result(self._admin_adjustment_error_reply(exc))
+            return
+        except Exception:
+            logger.exception("FAPI 管理员余额调整出现未预期错误")
+            yield event.plain_result("余额调整服务暂时不可用，请稍后重试。")
+            return
+
+        operation_name = "增加" if operation == "add" else "扣减"
+        logger.info(
+            "FAPI 管理员余额调整成功：admin=%s, user=%s, operation=%s, "
+            "amount_units=%s, idempotency_key=%s",
+            admin_context.sender_id,
+            user.user_id,
+            operation,
+            amount_units,
+            idempotency_key,
+        )
+        yield event.plain_result(
+            "余额调整成功\n"
+            f"用户：{self._safe_reply_field(user.username)}（ID {user.user_id}）\n"
+            f"操作：{operation_name}\n"
+            f"金额：{self._format_units(amount_units)}\n"
+            f"调整后余额：{self._format_usd(result.balance)}"
+        )
 
     @fapi.command("帮助", alias={"help", "菜单"})
     async def help_menu(self, event: AstrMessageEvent):
@@ -1341,6 +1535,107 @@ class FapiPlugin(Star):
             f"累计签到：{reservation.total_days} 天"
         )
 
+    async def _private_admin_context(
+        self,
+        event: AstrMessageEvent,
+    ) -> tuple[PrivateAdminContext | None, str | None]:
+        try:
+            platform = str(event.get_platform_name()).strip().casefold()
+        except Exception:
+            platform = ""
+        if platform not in _SUPPORTED_QQ_PLATFORMS:
+            return None, "该指令仅支持 QQ 机器人平台。"
+
+        get_group_id = getattr(event, "get_group_id", None)
+        try:
+            group_id = (
+                str(get_group_id() or "").strip()
+                if callable(get_group_id)
+                else ""
+            )
+        except Exception:
+            group_id = ""
+        if self._valid_platform_identifier(group_id):
+            return None, "管理员管理指令只能在私聊中使用。"
+
+        try:
+            sender_id = str(event.get_sender_id()).strip()
+        except Exception:
+            sender_id = ""
+        if not self._valid_platform_identifier(sender_id):
+            return None, "无法识别当前 QQ 用户，请稍后重试。"
+
+        is_admin = getattr(event, "is_admin", None)
+        try:
+            allowed = is_admin() if callable(is_admin) else False
+            if inspect.isawaitable(allowed):
+                allowed = await allowed
+        except Exception:
+            allowed = False
+        if allowed is not True:
+            return None, "该指令仅限 AstrBot 管理员私聊使用。"
+
+        return PrivateAdminContext(platform, sender_id), None
+
+    async def _resolve_private_admin_user(
+        self,
+        username: str,
+    ) -> tuple[TokenRouterUser | None, str | None]:
+        exact_username = username.strip()
+        if not exact_username:
+            return None, "请输入用户名，用户名必须完全一致。"
+        if len(exact_username) > 128 or any(
+            ord(character) < 32 or 127 <= ord(character) <= 159
+            for character in exact_username
+        ):
+            return None, "用户名格式不正确。"
+
+        try:
+            users = await self.client.find_users_by_exact_username(exact_username)
+        except TokenRouterError as exc:
+            logger.warning(
+                "FAPI 管理员精确查询用户失败：status=%s, code=%s, error=%s",
+                exc.status_code,
+                exc.api_code,
+                exc,
+            )
+            return None, self._api_error_reply(exc)
+        except Exception:
+            logger.exception("FAPI 管理员精确查询用户出现未预期错误")
+            return None, "管理员查询服务暂时不可用，请稍后重试。"
+
+        if not users:
+            return None, f"未找到用户名完全匹配“{exact_username}”的中转站用户。"
+        if len(users) > 1:
+            return None, "存在多个同名用户，为避免误操作，本次管理操作已取消。"
+        return users[0], None
+
+    @staticmethod
+    def _admin_balance_operation_key(
+        event: AstrMessageEvent,
+        admin_context: PrivateAdminContext,
+        operation: str,
+    ) -> str | None:
+        digest = FapiPlugin._operation_key(
+            event,
+            admin_context.platform,
+            f"private:{admin_context.sender_id}",
+            f"admin-balance:{operation}",
+        )
+        return f"fapi-admin-balance:v1:{digest}" if digest else None
+
+    @staticmethod
+    def _safe_reply_field(value: object, *, maximum: int = 254) -> str:
+        text = "".join(
+            (
+                character
+                if ord(character) >= 32 and not 127 <= ord(character) <= 159
+                else " "
+            )
+            for character in str(value)
+        )
+        return text[:maximum]
+
     def _group_command_context(
         self,
         event: AstrMessageEvent,
@@ -1620,3 +1915,13 @@ class FapiPlugin(Star):
         if exc.status_code == 429:
             return "中转站查询太频繁，请稍后再试。"
         return "中转站用户查询失败，请稍后重试。"
+
+    @staticmethod
+    def _admin_adjustment_error_reply(exc: TokenRouterError) -> str:
+        if exc.status_code in {401, 403}:
+            return "中转站鉴权失败，请检查插件配置。"
+        if exc.status_code == 409:
+            return "余额调整发生幂等冲突，请先核对用户余额，不要重复操作。"
+        if exc.status_code == 429:
+            return "中转站请求太频繁，本次余额调整未完成，请稍后再试。"
+        return "中转站余额调整失败，本次操作未完成。"

@@ -346,6 +346,220 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         for name in self.loaded_names:
             sys.modules.pop(name, None)
 
+    async def test_private_admin_menu_is_available_without_group_context(self):
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=True),
+            )
+        )
+
+        self.assertEqual(len(replies), 1)
+        self.assertIn("FAPI 管理员私聊菜单", replies[0])
+        self.assertIn("/fapi 管理 查询 <用户名>", replies[0])
+        self.assertIn("USD 1,000.00", replies[0])
+
+    async def test_private_admin_rejects_regular_user_before_external_access(self):
+        class ForbiddenClient:
+            def __getattr__(_self, name):
+                async def forbidden(*_args, **_kwargs):
+                    raise AssertionError(f"管理员门禁前不应调用 {name}")
+
+                return forbidden
+
+        self.plugin.client = ForbiddenClient()
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=False),
+                "查询",
+                "alice",
+            )
+        )
+
+        self.assertEqual(replies, ["该指令仅限 AstrBot 管理员私聊使用。"])
+
+    async def test_private_admin_rejects_group_even_for_astrbot_admin(self):
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(group_id="987654321", astrbot_admin=True),
+            )
+        )
+
+        self.assertEqual(replies, ["管理员管理指令只能在私聊中使用。"])
+
+    async def test_private_admin_accepts_async_admin_check(self):
+        event = FakeEvent(group_id=None)
+
+        async def is_admin():
+            return True
+
+        event.is_admin = is_admin
+        replies = await collect(self.plugin.admin_private(event))
+
+        self.assertIn("FAPI 管理员私聊菜单", replies[0])
+
+    async def test_private_admin_queries_exact_user(self):
+        class Client:
+            async def find_users_by_exact_username(_self, username):
+                self.assertEqual(username, "alice")
+                return [user(7, "alice", "alice@example.com")]
+
+            async def get_balance_summary(_self, user_id):
+                self.assertEqual(user_id, 7)
+                return SimpleNamespace(
+                    balance=Decimal("12.5"),
+                    used_last_30_days=Decimal("3.25"),
+                    concurrency=8,
+                )
+
+        self.plugin.client = Client()
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=True),
+                "查询",
+                "alice",
+            )
+        )
+
+        self.assertEqual(len(replies), 1)
+        self.assertIn("ID：7", replies[0])
+        self.assertIn("邮箱：alice@example.com", replies[0])
+        self.assertIn("余额：USD 12.50", replies[0])
+        self.assertIn("已使用（近30天）：USD 3.25", replies[0])
+        self.assertIn("并发上限：8", replies[0])
+
+    async def test_private_admin_refuses_duplicate_exact_username(self):
+        class Client:
+            async def find_users_by_exact_username(_self, _username):
+                return [
+                    user(7, "alice", "first@example.com"),
+                    user(8, "alice", "second@example.com"),
+                ]
+
+            async def adjust_balance(_self, **_values):
+                raise AssertionError("重名用户不应调账")
+
+        self.plugin.client = Client()
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=True),
+                "加余额",
+                "alice",
+                "1.25",
+            )
+        )
+
+        self.assertEqual(
+            replies,
+            ["存在多个同名用户，为避免误操作，本次管理操作已取消。"],
+        )
+
+    async def test_private_admin_adds_balance_with_stable_idempotency_key(self):
+        class Client:
+            def __init__(_self):
+                _self.adjustments = []
+
+            async def find_users_by_exact_username(_self, _username):
+                return [user(7, "alice", "alice@example.com")]
+
+            async def adjust_balance(_self, **values):
+                _self.adjustments.append(values)
+                return SimpleNamespace(balance=Decimal("13.75"))
+
+        client = Client()
+        self.plugin.client = client
+        event = FakeEvent(
+            group_id=None,
+            astrbot_admin=True,
+            message_id="admin-message-1",
+        )
+
+        first = await collect(
+            self.plugin.admin_private(event, "加余额", "alice", "1.25")
+        )
+        second = await collect(
+            self.plugin.admin_private(event, "加余额", "alice", "1.25")
+        )
+
+        self.assertIn("余额调整成功", first[0])
+        self.assertIn("操作：增加", first[0])
+        self.assertIn("调整后余额：USD 13.75", first[0])
+        self.assertEqual(first, second)
+        self.assertEqual(len(client.adjustments), 2)
+        self.assertEqual(client.adjustments[0]["amount"], Decimal("1.25"))
+        self.assertEqual(client.adjustments[0]["operation"], "add")
+        self.assertEqual(
+            client.adjustments[0]["idempotency_key"],
+            client.adjustments[1]["idempotency_key"],
+        )
+        self.assertTrue(
+            client.adjustments[0]["idempotency_key"].startswith(
+                "fapi-admin-balance:v1:"
+            )
+        )
+
+    async def test_private_admin_validates_write_before_user_lookup(self):
+        class ForbiddenClient:
+            async def find_users_by_exact_username(_self, _username):
+                raise AssertionError("非法金额不应查询用户")
+
+        self.plugin.client = ForbiddenClient()
+        event = FakeEvent(group_id=None, astrbot_admin=True)
+
+        too_large = await collect(
+            self.plugin.admin_private(event, "加余额", "alice", "1000.00000001")
+        )
+        missing_message_id = await collect(
+            self.plugin.admin_private(
+                FakeEvent(
+                    group_id=None,
+                    astrbot_admin=True,
+                    message_id=None,
+                    raw_message={},
+                ),
+                "减余额",
+                "alice",
+                "1.00",
+            )
+        )
+
+        self.assertIn("单次余额调整不能超过", too_large[0])
+        self.assertIn("无法确认当前消息编号", missing_message_id[0])
+
+    async def test_private_admin_reports_insufficient_and_unknown_outcomes(self):
+        class Client:
+            def __init__(_self):
+                _self.unknown = False
+
+            async def find_users_by_exact_username(_self, _username):
+                return [user(7, "alice", "alice@example.com")]
+
+            async def adjust_balance(_self, **_values):
+                if _self.unknown:
+                    raise self.module.TokenRouterError(
+                        "timeout",
+                        outcome_unknown=True,
+                    )
+                raise self.module.TokenRouterError(
+                    "insufficient balance",
+                    status_code=400,
+                    api_code="INSUFFICIENT_BALANCE",
+                )
+
+        client = Client()
+        self.plugin.client = client
+        event = FakeEvent(group_id=None, astrbot_admin=True)
+
+        insufficient = await collect(
+            self.plugin.admin_private(event, "减余额", "alice", "1.00")
+        )
+        client.unknown = True
+        unknown = await collect(
+            self.plugin.admin_private(event, "加余额", "alice", "1.00")
+        )
+
+        self.assertEqual(insufficient, ["用户余额不足，本次未扣减。"])
+        self.assertIn("不要重复发送调账命令", unknown[0])
+
     async def test_requires_username(self):
         replies = await collect(self.plugin.bind(FakeEvent()))
 

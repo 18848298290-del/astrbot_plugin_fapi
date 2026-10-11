@@ -2,7 +2,7 @@
   "allowed_group_id": {
     "description": "指定 QQ 群 ID",
     "type": "string",
-    "hint": "所有 /fapi 操作只能在此群使用。OneBot 填群号；QQ 官方机器人填群 group_openid。留空时插件拒绝所有业务指令。",
+    "hint": "除管理员私聊入口外，所有 /fapi 操作只能在此群使用。OneBot 填群号；QQ 官方机器人填群 group_openid。留空时插件拒绝所有群业务指令。",
     "default": ""
   },
   "tokenrouter_url": {
@@ -14,9 +14,21 @@
   "admin_api_key": {
     "description": "管理 API Key",
     "type": "string",
-    "hint": "用于查询用户、发放签到和红包奖励，以及执行游戏扣款、派奖和退款。请仅授予可信机器人使用。",
+    "hint": "用于查询用户、管理员私聊调账、发放奖励，以及执行游戏扣款、派奖和退款。请仅授予可信机器人使用。",
     "default": "",
     "secret": true
+  },
+  "admin_private_enabled": {
+    "description": "启用管理员私聊功能",
+    "type": "bool",
+    "hint": "仅 AstrBot 管理员可在 QQ 私聊中查询中转站用户并调整余额；群聊中始终拒绝。",
+    "default": true
+  },
+  "admin_balance_adjustment_max": {
+    "description": "管理员单次调账上限",
+    "type": "string",
+    "hint": "管理员私聊命令单次增加或扣减余额的最大金额，最多支持 8 位小数。",
+    "default": "1000.00"
   },
   "request_timeout": {
     "description": "中转站请求超时秒数",
