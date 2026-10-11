@@ -14,7 +14,7 @@
   "admin_api_key": {
     "description": "管理 API Key",
     "type": "string",
-    "hint": "用于查询用户并通过创建且兑换余额码发放签到、红包奖励。请仅授予可信机器人使用。",
+    "hint": "用于查询用户、发放签到和红包奖励，以及执行游戏扣款、派奖和退款。请仅授予可信机器人使用。",
     "default": "",
     "secret": true
   },
@@ -121,6 +121,57 @@
     "default": 60,
     "slider": {"min": 1, "max": 1440, "step": 1}
   },
+  "robbery_enabled": {
+    "description": "启用打劫",
+    "type": "bool",
+    "default": true
+  },
+  "robbery_amount": {
+    "description": "每次打劫金额",
+    "type": "string",
+    "hint": "打劫成功时从被 @ 用户余额扣除，并转入发起者余额。",
+    "default": "0.10"
+  },
+  "robbery_success_rate": {
+    "description": "打劫成功率（百分比）",
+    "type": "int",
+    "default": 30,
+    "slider": {"min": 0, "max": 100, "step": 1}
+  },
+  "robbery_cooldown_seconds": {
+    "description": "打劫冷却秒数",
+    "type": "int",
+    "default": 300,
+    "slider": {"min": 0, "max": 86400, "step": 1}
+  },
+  "slot_enabled": {
+    "description": "启用老虎机",
+    "type": "bool",
+    "default": true
+  },
+  "slot_cost": {
+    "description": "老虎机单次投入",
+    "type": "string",
+    "default": "0.10"
+  },
+  "slot_prize": {
+    "description": "老虎机中奖奖金",
+    "type": "string",
+    "hint": "中奖时发放的总奖金；实际净收益为奖金减去单次投入。",
+    "default": "0.20"
+  },
+  "slot_success_rate": {
+    "description": "老虎机中奖率（百分比）",
+    "type": "int",
+    "default": 40,
+    "slider": {"min": 0, "max": 100, "step": 1}
+  },
+  "slot_cooldown_seconds": {
+    "description": "老虎机冷却秒数",
+    "type": "int",
+    "default": 10,
+    "slider": {"min": 0, "max": 86400, "step": 1}
+  },
   "reward_timezone": {
     "description": "奖励日期时区",
     "type": "string",
@@ -151,5 +202,11 @@
     "description": "奖励预算表名",
     "type": "string",
     "default": "astrbot_fapi_reward_budgets"
+  },
+  "mysql_game_operations_table": {
+    "description": "游戏结算记录表名",
+    "type": "string",
+    "hint": "用于游戏幂等扣款、派奖、退款和故障重试。",
+    "default": "astrbot_fapi_game_operations"
   }
 }

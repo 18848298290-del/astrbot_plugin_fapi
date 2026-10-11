@@ -6,6 +6,8 @@ import httpx
 from tokenrouter_client import (
     TokenRouterClient,
     TokenRouterError,
+    is_insufficient_balance_error,
+    resolve_balance_adjustment,
     resolve_balance_summary,
     resolve_exact_username_users,
     resolve_reward_result,
@@ -194,7 +196,78 @@ class ResolveRewardResultTest(unittest.TestCase):
         self.assertEqual(raised.exception.api_code, "REWARD_RESPONSE_MISMATCH")
 
 
+class ResolveBalanceAdjustmentTest(unittest.TestCase):
+    def test_requires_matching_user_and_non_negative_balance(self):
+        result = resolve_balance_adjustment(
+            {"id": 7, "balance": "12.34567890"},
+            expected_user_id=7,
+        )
+
+        self.assertEqual(result.user_id, 7)
+        self.assertEqual(result.balance, Decimal("12.34567890"))
+
+        for data in ({"id": 8, "balance": 1}, {"id": 7, "balance": -1}):
+            with self.subTest(data=data):
+                with self.assertRaises(TokenRouterError) as raised:
+                    resolve_balance_adjustment(data, expected_user_id=7)
+                self.assertTrue(raised.exception.outcome_unknown)
+
+    def test_identifies_atomic_insufficient_balance_error(self):
+        self.assertTrue(
+            is_insufficient_balance_error(
+                TokenRouterError(
+                    "balance cannot be negative",
+                    status_code=400,
+                    api_code="BALANCE_NEGATIVE",
+                )
+            )
+        )
+        self.assertFalse(
+            is_insufficient_balance_error(
+                TokenRouterError("service unavailable", status_code=503)
+            )
+        )
+
+
 class TokenRouterClientTest(unittest.IsolatedAsyncioTestCase):
+    async def test_adjusts_balance_with_stable_idempotency_key(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(request.url.path, "/api/v1/admin/users/7/balance")
+            self.assertEqual(request.headers["idempotency-key"], "game-op:debit")
+            self.assertEqual(
+                request.read(),
+                b'{"balance":0.1,"operation":"subtract",'
+                b'"notes":"slot stake"}',
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "message": "success",
+                    "data": {"id": 7, "balance": 9.9},
+                },
+            )
+
+        client = TokenRouterClient(
+            "https://tokenrouter.example.com",
+            "secret",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            result = await client.adjust_balance(
+                user_id=7,
+                amount=Decimal("0.10"),
+                operation="subtract",
+                idempotency_key="game-op:debit",
+                notes="slot stake",
+            )
+        finally:
+            await client.close()
+
+        self.assertEqual(result.user_id, 7)
+        self.assertEqual(result.balance, Decimal("9.9"))
+
     async def test_creates_and_redeems_reward_with_stable_idempotency_key(self):
         def handler(request: httpx.Request) -> httpx.Response:
             self.assertEqual(request.method, "POST")

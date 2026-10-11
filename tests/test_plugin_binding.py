@@ -3,6 +3,7 @@ import logging
 import sys
 import types
 import unittest
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,6 +66,7 @@ def load_plugin_module():
         *modules,
         module_name,
         f"{package_name}.binding_store",
+        f"{package_name}.game_store",
         f"{package_name}.tokenrouter_client",
         f"{package_name}.reward_store",
     ]
@@ -81,15 +83,24 @@ class FakeEvent:
         astrbot_admin=False,
         group=None,
         message_id="message-1",
+        self_id="bot-qq",
+        messages=None,
+        raw_message=None,
     ):
         self.sender_id = sender_id
         self.platform_name = platform_name
         self.group_id = group_id
         self.astrbot_admin = astrbot_admin
         self.group = group
+        self.self_id = self_id
+        self.messages = list(messages or [])
+        if raw_message is None:
+            raw_message = {"sender": {"role": role}} if role is not None else {}
         self.message_obj = SimpleNamespace(
-            raw_message={"sender": {"role": role}} if role is not None else {},
+            raw_message=raw_message,
             message_id=message_id,
+            message=self.messages,
+            self_id=self_id,
         )
 
     def get_sender_id(self):
@@ -100,6 +111,12 @@ class FakeEvent:
 
     def get_group_id(self):
         return self.group_id
+
+    def get_self_id(self):
+        return self.self_id
+
+    def get_messages(self):
+        return self.messages
 
     def is_admin(self):
         return self.astrbot_admin
@@ -123,6 +140,172 @@ def user(user_id, username, email):
         email=email,
         status="active",
     )
+
+
+def game_operation(
+    module,
+    *,
+    game_type="robbery",
+    status=None,
+    won=True,
+    operation_key="game-key",
+    actor_qq_id="12345",
+    actor_user_id=11,
+    target_qq_id="67890",
+    target_user_id=22,
+    debit_user_id=22,
+    credit_user_id=11,
+    debit_units=10_000_000,
+    credit_units=10_000_000,
+):
+    return module.GameOperation(
+        operation_id="game-op-1",
+        operation_key=operation_key,
+        game_type=game_type,
+        group_id="987654321",
+        actor_qq_id=actor_qq_id,
+        actor_user_id=actor_user_id,
+        target_qq_id=target_qq_id,
+        target_user_id=target_user_id,
+        debit_user_id=debit_user_id,
+        credit_user_id=credit_user_id,
+        debit_units=debit_units,
+        credit_units=credit_units,
+        won=won,
+        status=status or module.GameStatus.SUCCEEDED,
+        attempt_count=0,
+        last_error=None,
+        next_attempt_at=None,
+        created_at=None,
+    )
+
+
+class InMemoryGameStore:
+    def __init__(self, module, operation=None, cooldown_seconds=None):
+        self.module = module
+        self.operation = operation
+        self.cooldown_seconds = cooldown_seconds
+        self.reserve_calls = []
+        self.transition_calls = []
+
+    async def get_by_key(self, operation_key):
+        if self.operation is None or self.operation.operation_key != operation_key:
+            return None
+        return self.operation
+
+    async def reserve_game(self, **values):
+        self.reserve_calls.append(values)
+        if self.cooldown_seconds is not None:
+            raise self.module.GameCooldownActive(self.cooldown_seconds)
+        status = (
+            self.module.GameStatus.PENDING_DEBIT
+            if values["debit_units"] > 0
+            else self.module.GameStatus.PENDING_CREDIT
+            if values["credit_units"] > 0
+            else self.module.GameStatus.SUCCEEDED
+        )
+        self.operation = self.module.GameOperation(
+            operation_id="game-op-1",
+            operation_key=values["operation_key"],
+            game_type=values["game_type"],
+            group_id=values["group_id"],
+            actor_qq_id=values["actor_qq_id"],
+            actor_user_id=values["actor_user_id"],
+            target_qq_id=values.get("target_qq_id"),
+            target_user_id=values.get("target_user_id"),
+            debit_user_id=values["debit_user_id"],
+            credit_user_id=values.get("credit_user_id"),
+            debit_units=values["debit_units"],
+            credit_units=values["credit_units"],
+            won=values["won"],
+            status=status,
+            attempt_count=0,
+            last_error=None,
+            next_attempt_at=None,
+            created_at=None,
+        )
+        return SimpleNamespace(operation=self.operation, existing=False)
+
+    async def get(self, operation_id):
+        if self.operation is None or self.operation.operation_id != operation_id:
+            return None
+        return self.operation
+
+    async def mark_debited(self, operation_id):
+        self.transition_calls.append(("debited", operation_id))
+        status = (
+            self.module.GameStatus.PENDING_CREDIT
+            if self.operation.credit_units > 0
+            else self.module.GameStatus.SUCCEEDED
+        )
+        self.operation = replace(self.operation, status=status)
+
+    async def mark_succeeded(self, operation_id):
+        self.transition_calls.append(("succeeded", operation_id))
+        self.operation = replace(
+            self.operation,
+            status=self.module.GameStatus.SUCCEEDED,
+        )
+
+    async def mark_insufficient(self, operation_id):
+        self.transition_calls.append(("insufficient", operation_id))
+        self.operation = replace(
+            self.operation,
+            status=self.module.GameStatus.INSUFFICIENT,
+        )
+
+    async def mark_failed(self, operation_id):
+        self.transition_calls.append(("failed", operation_id))
+        self.operation = replace(
+            self.operation,
+            status=self.module.GameStatus.FAILED,
+        )
+
+    async def mark_pending_refund(self, operation_id):
+        self.transition_calls.append(("pending_refund", operation_id))
+        self.operation = replace(
+            self.operation,
+            status=self.module.GameStatus.PENDING_REFUND,
+        )
+
+    async def mark_refunded(self, operation_id):
+        self.transition_calls.append(("refunded", operation_id))
+        self.operation = replace(
+            self.operation,
+            status=self.module.GameStatus.REFUNDED,
+        )
+
+    async def record_error(self, operation_id, error, **values):
+        self.transition_calls.append(("error", operation_id, error, values))
+
+
+class GameBindings:
+    def __init__(self, values):
+        self.values = values
+        self.calls = []
+
+    async def get_by_qq(self, qq_id):
+        self.calls.append(qq_id)
+        user_id = self.values.get(qq_id)
+        if user_id is None:
+            return None
+        return SimpleNamespace(tokenrouter_user_id=user_id)
+
+
+class BalanceClient:
+    def __init__(self, module, fail_on=None):
+        self.module = module
+        self.fail_on = fail_on
+        self.calls = []
+
+    async def adjust_balance(self, **values):
+        self.calls.append(values)
+        if self.fail_on == len(self.calls):
+            raise self.module.TokenRouterError(
+                "insufficient balance",
+                status_code=400,
+                api_code="INSUFFICIENT_BALANCE",
+            )
 
 
 class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
@@ -153,6 +336,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/fapi 余额", replies[0])
         self.assertIn("/fapi 签到", replies[0])
         self.assertIn("/fapi 抢红包 [红包编号]", replies[0])
+        self.assertIn("/fapi 打劫 @用户", replies[0])
+        self.assertIn("/fapi 老虎机", replies[0])
         self.assertIn("群主、群管理员或 AstrBot 管理员", replies[0])
 
     async def test_official_help_menu_requires_email_and_astrbot_admin(self):
@@ -212,6 +397,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.plugin.client = ForbiddenDependency()
         self.plugin.bindings = ForbiddenDependency()
         self.plugin.rewards = ForbiddenDependency()
+        self.plugin.games = ForbiddenDependency()
         event = FakeEvent(role="admin", astrbot_admin=True)
         commands = (
             self.plugin.help_menu(event),
@@ -222,6 +408,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             self.plugin.create_red_packet(event, "1.00", 1),
             self.plugin.claim_red_packet(event),
             self.plugin.red_packet_status(event),
+            self.plugin.robbery(event),
+            self.plugin.slot_machine(event),
         )
 
         for command in commands:
@@ -241,6 +429,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.plugin.client = ForbiddenDependency()
         self.plugin.bindings = ForbiddenDependency()
         self.plugin.rewards = ForbiddenDependency()
+        self.plugin.games = ForbiddenDependency()
         event = FakeEvent(
             group_id="another-group-openid",
             role="admin",
@@ -255,6 +444,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             self.plugin.create_red_packet(event, "1.00", 1),
             self.plugin.claim_red_packet(event),
             self.plugin.red_packet_status(event),
+            self.plugin.robbery(event),
+            self.plugin.slot_machine(event),
         )
 
         for command in commands:
@@ -382,6 +573,396 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(command_context)
         self.assertEqual(error, "该指令仅支持 QQ 机器人平台。")
+
+    async def test_onebot_mention_uses_structured_at_component(self):
+        event = FakeEvent(
+            messages=[SimpleNamespace(type="At", qq="67890")],
+        )
+        command_context, error = self.plugin._group_command_context(event)
+
+        self.assertIsNone(error)
+        self.assertEqual(
+            self.plugin._mentioned_target_id(event, command_context),
+            "67890",
+        )
+
+    async def test_onebot_mention_rejects_plain_text_and_multiple_targets(self):
+        command_context, error = self.plugin._group_command_context(FakeEvent())
+        self.assertIsNone(error)
+
+        plain_text = FakeEvent(
+            messages=[SimpleNamespace(type="Plain", text="@67890")],
+        )
+        multiple_targets = FakeEvent(
+            messages=[
+                SimpleNamespace(type="At", qq="67890"),
+                SimpleNamespace(type="At", qq="54321"),
+            ],
+        )
+
+        self.assertIsNone(
+            self.plugin._mentioned_target_id(plain_text, command_context)
+        )
+        self.assertIsNone(
+            self.plugin._mentioned_target_id(multiple_targets, command_context)
+        )
+
+    async def test_official_mention_prefers_member_openid(self):
+        self.plugin._allowed_group_id = "official-group-openid"
+        event = FakeEvent(
+            sender_id="actor-member-openid",
+            platform_name="qq_official",
+            group_id="official-group-openid",
+            raw_message={
+                "mentions": [
+                    {
+                        "id": "target-member-openid",
+                        "member_openid": "target-member-openid",
+                        "is_you": False,
+                    }
+                ]
+            },
+        )
+        command_context, error = self.plugin._group_command_context(event)
+
+        self.assertIsNone(error)
+        self.assertEqual(
+            self.plugin._mentioned_target_id(event, command_context),
+            "target-member-openid",
+        )
+
+    async def test_official_mention_rejects_conflicting_openids(self):
+        self.plugin._allowed_group_id = "official-group-openid"
+        event = FakeEvent(
+            sender_id="actor-member-openid",
+            platform_name="qq_official",
+            group_id="official-group-openid",
+            raw_message={
+                "mentions": [
+                    {
+                        "id": "different-openid",
+                        "member_openid": "target-member-openid",
+                        "is_you": False,
+                    }
+                ]
+            },
+        )
+        command_context, error = self.plugin._group_command_context(event)
+
+        self.assertIsNone(error)
+        self.assertIsNone(
+            self.plugin._mentioned_target_id(event, command_context)
+        )
+
+    async def test_official_mention_ignores_bot_and_rejects_multiple_targets(self):
+        self.plugin._allowed_group_id = "official-group-openid"
+        base_values = {
+            "sender_id": "actor-member-openid",
+            "platform_name": "qq_official",
+            "group_id": "official-group-openid",
+        }
+        bot_only = FakeEvent(
+            **base_values,
+            raw_message={
+                "mentions": [
+                    {"member_openid": "bot-openid", "is_you": True},
+                ]
+            },
+        )
+        multiple_targets = FakeEvent(
+            **base_values,
+            raw_message={
+                "mentions": [
+                    {"member_openid": "target-one", "is_you": False},
+                    {"member_openid": "target-two", "is_you": False},
+                ]
+            },
+        )
+        command_context, error = self.plugin._group_command_context(bot_only)
+
+        self.assertIsNone(error)
+        self.assertIsNone(
+            self.plugin._mentioned_target_id(bot_only, command_context)
+        )
+        self.assertIsNone(
+            self.plugin._mentioned_target_id(multiple_targets, command_context)
+        )
+
+    async def test_robbery_success_transfers_between_bound_users_once(self):
+        event = FakeEvent(
+            messages=[SimpleNamespace(type="At", qq="67890")],
+            message_id="robbery-message-1",
+        )
+        bindings = GameBindings({"12345": 11, "67890": 22})
+        games = InMemoryGameStore(self.module)
+        client = BalanceClient(self.module)
+        self.plugin.bindings = bindings
+        self.plugin.games = games
+        self.plugin.client = client
+        self.module.roll_success = lambda _rate: True
+
+        first_reply = await collect(self.plugin.robbery(event))
+        second_reply = await collect(self.plugin.robbery(event))
+
+        self.assertEqual(first_reply, second_reply)
+        self.assertEqual(
+            first_reply,
+            [
+                "打劫成功\n"
+                "获得：USD 0.10\n"
+                "金额已从对方账户转入你的账户。"
+            ],
+        )
+        self.assertEqual(bindings.calls, ["12345", "67890"])
+        self.assertEqual(len(games.reserve_calls), 1)
+        reservation = games.reserve_calls[0]
+        self.assertEqual(reservation["debit_user_id"], 22)
+        self.assertEqual(reservation["credit_user_id"], 11)
+        self.assertEqual(reservation["debit_units"], 10_000_000)
+        self.assertEqual(reservation["credit_units"], 10_000_000)
+        self.assertEqual(
+            [(call["user_id"], call["operation"]) for call in client.calls],
+            [(22, "subtract"), (11, "add")],
+        )
+        self.assertEqual(
+            [call["idempotency_key"] for call in client.calls],
+            [
+                "fapi-game:v1:game-op-1:debit",
+                "fapi-game:v1:game-op-1:credit",
+            ],
+        )
+
+    async def test_robbery_failed_roll_does_not_change_balance(self):
+        event = FakeEvent(messages=[SimpleNamespace(type="At", qq="67890")])
+        games = InMemoryGameStore(self.module)
+        client = BalanceClient(self.module)
+        self.plugin.bindings = GameBindings({"12345": 11, "67890": 22})
+        self.plugin.games = games
+        self.plugin.client = client
+        self.module.roll_success = lambda _rate: False
+
+        replies = await collect(self.plugin.robbery(event))
+
+        self.assertEqual(replies, ["打劫失败，本次没有余额变动。"])
+        self.assertEqual(client.calls, [])
+        self.assertEqual(games.reserve_calls[0]["debit_units"], 0)
+        self.assertEqual(games.reserve_calls[0]["credit_units"], 0)
+
+    async def test_robbery_insufficient_target_balance_never_credits_actor(self):
+        event = FakeEvent(messages=[SimpleNamespace(type="At", qq="67890")])
+        games = InMemoryGameStore(self.module)
+        client = BalanceClient(self.module, fail_on=1)
+        self.plugin.bindings = GameBindings({"12345": 11, "67890": 22})
+        self.plugin.games = games
+        self.plugin.client = client
+        self.module.roll_success = lambda _rate: True
+
+        replies = await collect(self.plugin.robbery(event))
+
+        self.assertEqual(replies, ["对方余额不足，本次打劫未得手。"])
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["user_id"], 22)
+        self.assertEqual(client.calls[0]["operation"], "subtract")
+        self.assertIn(("insufficient", "game-op-1"), games.transition_calls)
+
+    async def test_robbery_requires_both_users_to_be_bound(self):
+        event = FakeEvent(messages=[SimpleNamespace(type="At", qq="67890")])
+        games = InMemoryGameStore(self.module)
+        bindings = GameBindings({"12345": 11})
+        self.plugin.bindings = bindings
+        self.plugin.games = games
+
+        replies = await collect(self.plugin.robbery(event))
+
+        self.assertEqual(replies, ["被 @ 用户尚未绑定中转站账号，无法打劫。"])
+        self.assertCountEqual(bindings.calls, ["12345", "67890"])
+        self.assertEqual(games.reserve_calls, [])
+
+    async def test_robbery_reports_cooldown_without_settlement(self):
+        event = FakeEvent(messages=[SimpleNamespace(type="At", qq="67890")])
+        games = InMemoryGameStore(self.module, cooldown_seconds=37)
+        client = BalanceClient(self.module)
+        self.plugin.bindings = GameBindings({"12345": 11, "67890": 22})
+        self.plugin.games = games
+        self.plugin.client = client
+
+        replies = await collect(self.plugin.robbery(event))
+
+        self.assertEqual(replies, ["打劫冷却中，请在 37 秒后再试。"])
+        self.assertEqual(client.calls, [])
+
+    async def test_slot_win_debits_cost_then_credits_prize(self):
+        games = InMemoryGameStore(self.module)
+        client = BalanceClient(self.module)
+        self.plugin.bindings = GameBindings({"12345": 11})
+        self.plugin.games = games
+        self.plugin.client = client
+        self.module.roll_success = lambda _rate: True
+
+        replies = await collect(self.plugin.slot_machine(FakeEvent()))
+
+        self.assertEqual(
+            replies,
+            ["老虎机中奖\n投入：USD 0.10\n奖金：USD 0.20"],
+        )
+        reservation = games.reserve_calls[0]
+        self.assertEqual(reservation["debit_user_id"], 11)
+        self.assertEqual(reservation["credit_user_id"], 11)
+        self.assertEqual(reservation["debit_units"], 10_000_000)
+        self.assertEqual(reservation["credit_units"], 20_000_000)
+        self.assertEqual(
+            [
+                (call["operation"], call["amount"], call["idempotency_key"])
+                for call in client.calls
+            ],
+            [
+                (
+                    "subtract",
+                    Decimal("0.10"),
+                    "fapi-game:v1:game-op-1:debit",
+                ),
+                (
+                    "add",
+                    Decimal("0.20"),
+                    "fapi-game:v1:game-op-1:credit",
+                ),
+            ],
+        )
+
+    async def test_slot_loss_only_debits_cost(self):
+        games = InMemoryGameStore(self.module)
+        client = BalanceClient(self.module)
+        self.plugin.bindings = GameBindings({"12345": 11})
+        self.plugin.games = games
+        self.plugin.client = client
+        self.module.roll_success = lambda _rate: False
+
+        replies = await collect(self.plugin.slot_machine(FakeEvent()))
+
+        self.assertEqual(replies, ["老虎机未中奖\n本次投入：USD 0.10"])
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["operation"], "subtract")
+        self.assertEqual(client.calls[0]["amount"], Decimal("0.10"))
+        self.assertIsNone(games.reserve_calls[0]["credit_user_id"])
+        self.assertEqual(games.reserve_calls[0]["credit_units"], 0)
+
+    async def test_slot_insufficient_balance_never_pays_prize(self):
+        games = InMemoryGameStore(self.module)
+        client = BalanceClient(self.module, fail_on=1)
+        self.plugin.bindings = GameBindings({"12345": 11})
+        self.plugin.games = games
+        self.plugin.client = client
+        self.module.roll_success = lambda _rate: True
+
+        replies = await collect(self.plugin.slot_machine(FakeEvent()))
+
+        self.assertEqual(replies, ["余额不足，无法支付本次老虎机投入。"])
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["operation"], "subtract")
+        self.assertIn(("insufficient", "game-op-1"), games.transition_calls)
+
+    async def test_slot_reports_cooldown_without_charging(self):
+        games = InMemoryGameStore(self.module, cooldown_seconds=9)
+        client = BalanceClient(self.module)
+        self.plugin.bindings = GameBindings({"12345": 11})
+        self.plugin.games = games
+        self.plugin.client = client
+
+        replies = await collect(self.plugin.slot_machine(FakeEvent()))
+
+        self.assertEqual(replies, ["老虎机冷却中，请在 9 秒后再试。"])
+        self.assertEqual(client.calls, [])
+
+    async def test_game_credit_failure_refunds_original_debit_user(self):
+        operation = game_operation(
+            self.module,
+            status=self.module.GameStatus.PENDING_CREDIT,
+        )
+        games = InMemoryGameStore(self.module, operation=operation)
+
+        class Client:
+            def __init__(_self):
+                _self.calls = []
+
+            async def adjust_balance(_self, **values):
+                _self.calls.append(values)
+                if len(_self.calls) == 1:
+                    raise self.module.TokenRouterError(
+                        "credit rejected",
+                        status_code=400,
+                        api_code="INVALID_BALANCE_ADJUSTMENT",
+                    )
+
+        client = Client()
+        self.plugin.games = games
+        self.plugin.client = client
+
+        settled = await self.plugin._settle_game_operation(operation)
+
+        self.assertEqual(settled.status, self.module.GameStatus.REFUNDED)
+        self.assertEqual(
+            [(call["user_id"], call["operation"]) for call in client.calls],
+            [(11, "add"), (22, "add")],
+        )
+        self.assertEqual(
+            [call["idempotency_key"] for call in client.calls],
+            [
+                "fapi-game:v1:game-op-1:credit",
+                "fapi-game:v1:game-op-1:refund",
+            ],
+        )
+        self.assertIn(("pending_refund", "game-op-1"), games.transition_calls)
+        self.assertIn(("refunded", "game-op-1"), games.transition_calls)
+
+    async def test_retryable_game_error_keeps_pending_state(self):
+        operation = game_operation(
+            self.module,
+            game_type="slots",
+            status=self.module.GameStatus.PENDING_DEBIT,
+            target_qq_id=None,
+            target_user_id=None,
+            debit_user_id=11,
+            credit_user_id=11,
+            debit_units=10_000_000,
+            credit_units=20_000_000,
+        )
+        games = InMemoryGameStore(self.module, operation=operation)
+
+        class Client:
+            def __init__(_self):
+                _self.calls = []
+
+            async def adjust_balance(_self, **values):
+                _self.calls.append(values)
+                raise self.module.TokenRouterError(
+                    "rate limited",
+                    status_code=429,
+                    retry_after=12.2,
+                )
+
+        client = Client()
+        self.plugin.games = games
+        self.plugin.client = client
+
+        settled = await self.plugin._settle_game_operation(operation)
+
+        self.assertEqual(settled.status, self.module.GameStatus.PENDING_DEBIT)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(
+            client.calls[0]["idempotency_key"],
+            "fapi-game:v1:game-op-1:debit",
+        )
+        self.assertEqual(
+            games.transition_calls,
+            [
+                (
+                    "error",
+                    "game-op-1",
+                    "rate limited",
+                    {"base_delay_seconds": 13},
+                )
+            ],
+        )
 
     async def test_binds_exact_username_with_sender_qq_email(self):
         calls = []

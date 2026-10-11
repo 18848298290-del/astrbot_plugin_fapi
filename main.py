@@ -14,6 +14,15 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 from .binding_store import BindStatus, BindingDatabaseError, MySQLBindingStore
+from .game_store import (
+    GameCooldownActive,
+    GameDatabaseError,
+    GameOperation,
+    GameOperationConflict,
+    GameStatus,
+    MySQLGameStore,
+    roll_success,
+)
 from .reward_store import (
     MIN_RED_PACKET_UNITS,
     CheckinReservation,
@@ -27,7 +36,11 @@ from .reward_store import (
     money_to_units,
     units_to_decimal,
 )
-from .tokenrouter_client import TokenRouterClient, TokenRouterError
+from .tokenrouter_client import (
+    TokenRouterClient,
+    TokenRouterError,
+    is_insufficient_balance_error,
+)
 
 
 _SUPPORTED_QQ_PLATFORMS = frozenset({"aiocqhttp", "qq_official"})
@@ -43,8 +56,8 @@ class GroupCommandContext:
 @register(
     "astrbot_plugin_fapi",
     "FAPI",
-    "QQ 与 TokenRouter 账号互通、签到和群红包",
-    "3.2.0",
+    "QQ 与 TokenRouter 账号互通、签到、群红包和余额游戏",
+    "3.3.0",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -96,9 +109,22 @@ class FapiPlugin(Star):
                 config.get("mysql_reward_budgets_table", "astrbot_fapi_reward_budgets")
             ),
         )
+        self.games = MySQLGameStore(
+            **mysql_options,
+            table=str(
+                config.get(
+                    "mysql_game_operations_table",
+                    "astrbot_fapi_game_operations",
+                )
+            ),
+        )
         self._reward_delivery_lock = asyncio.Lock()
         self._reward_worker_task: asyncio.Task | None = None
+        self._game_command_lock = asyncio.Lock()
+        self._game_delivery_lock = asyncio.Lock()
+        self._game_worker_task: asyncio.Task | None = None
         self._reward_config_error = ""
+        self._game_config_error = ""
         try:
             self._reward_timezone = ZoneInfo(
                 str(config.get("reward_timezone", "Asia/Shanghai")).strip()
@@ -140,6 +166,43 @@ class FapiPlugin(Star):
         except (ValueError, ZoneInfoNotFoundError) as exc:
             self._reward_config_error = str(exc)
 
+        try:
+            self._robbery_enabled = bool(config.get("robbery_enabled", True))
+            self._robbery_amount_units = money_to_units(
+                config.get("robbery_amount", "0.10")
+            )
+            self._robbery_success_rate = int(
+                config.get("robbery_success_rate", 30)
+            )
+            self._robbery_cooldown_seconds = int(
+                config.get("robbery_cooldown_seconds", 300)
+            )
+            self._slot_enabled = bool(config.get("slot_enabled", True))
+            self._slot_cost_units = money_to_units(config.get("slot_cost", "0.10"))
+            self._slot_prize_units = money_to_units(
+                config.get("slot_prize", "0.20")
+            )
+            self._slot_success_rate = int(config.get("slot_success_rate", 40))
+            self._slot_cooldown_seconds = int(
+                config.get("slot_cooldown_seconds", 10)
+            )
+            for name, rate in (
+                ("打劫", self._robbery_success_rate),
+                ("老虎机", self._slot_success_rate),
+            ):
+                if not 0 <= rate <= 100:
+                    raise ValueError(f"{name}成功率必须在 0 到 100 之间")
+            for name, cooldown in (
+                ("打劫", self._robbery_cooldown_seconds),
+                ("老虎机", self._slot_cooldown_seconds),
+            ):
+                if not 0 <= cooldown <= 86400:
+                    raise ValueError(f"{name}冷却时间必须在 0 到 86400 秒之间")
+            if self._slot_prize_units < self._slot_cost_units:
+                raise ValueError("老虎机奖金不能小于单次投入")
+        except ValueError as exc:
+            self._game_config_error = str(exc)
+
     async def initialize(self) -> None:
         try:
             await self.bindings.initialize()
@@ -154,6 +217,16 @@ class FapiPlugin(Star):
                 self._reward_worker_task = asyncio.create_task(
                     self._reward_worker_loop(),
                     name="fapi-reward-worker",
+                )
+        try:
+            await self.games.initialize()
+        except GameDatabaseError as exc:
+            logger.error("FAPI 游戏数据表初始化失败：%s", exc)
+        else:
+            if not self._game_config_error:
+                self._game_worker_task = asyncio.create_task(
+                    self._game_worker_loop(),
+                    name="fapi-game-worker",
                 )
 
     @filter.command_group("fapi")
@@ -188,6 +261,8 @@ class FapiPlugin(Star):
             "/fapi 红包 <总金额> <份数>\n"
             "/fapi 抢红包 [红包编号]\n"
             "/fapi 红包状态 [红包编号]\n"
+            "/fapi 打劫 @用户\n"
+            "/fapi 老虎机\n"
             "/fapi 帮助\n\n"
             f"{red_packet_permission}"
         )
@@ -617,12 +692,176 @@ class FapiPlugin(Star):
             f"已到账：{packet.credited_count} 份"
         )
 
+    @fapi.command("打劫", alias={"打结", "rob"})
+    async def robbery(self, event: AstrMessageEvent):
+        """尝试从被 @ 用户的绑定账号转入固定金额。"""
+        command_context, context_error = self._group_command_context(event)
+        if context_error:
+            yield event.plain_result(context_error)
+            return
+        assert command_context is not None
+        if self._game_config_error:
+            yield event.plain_result("游戏配置不正确，请联系管理员检查插件配置。")
+            return
+        if not self._robbery_enabled:
+            yield event.plain_result("打劫功能当前未开启。")
+            return
+
+        target_qq_id = self._mentioned_target_id(event, command_context)
+        if target_qq_id is None:
+            yield event.plain_result("请只 @ 一名其他群成员：/fapi 打劫 @用户")
+            return
+        operation_key = self._game_operation_key(
+            event,
+            command_context,
+            "robbery",
+        )
+        if operation_key is None:
+            yield event.plain_result("无法确认当前消息编号，为避免重复扣款，本次操作已取消。")
+            return
+
+        early_reply = ""
+        try:
+            async with self._game_command_lock:
+                operation = await self.games.get_by_key(operation_key)
+                if operation is None:
+                    actor_binding, target_binding = await asyncio.gather(
+                        self.bindings.get_by_qq(command_context.sender_id),
+                        self.bindings.get_by_qq(target_qq_id),
+                    )
+                    if actor_binding is None:
+                        early_reply = (
+                            "当前账号尚未绑定中转站账号，请先使用 /fapi 绑定。"
+                        )
+                    elif target_binding is None:
+                        early_reply = "被 @ 用户尚未绑定中转站账号，无法打劫。"
+                    else:
+                        won = roll_success(self._robbery_success_rate)
+                        amount_units = self._robbery_amount_units if won else 0
+                        reservation = await self.games.reserve_game(
+                            operation_key=operation_key,
+                            game_type="robbery",
+                            group_id=command_context.group_id,
+                            actor_qq_id=command_context.sender_id,
+                            actor_user_id=actor_binding.tokenrouter_user_id,
+                            target_qq_id=target_qq_id,
+                            target_user_id=target_binding.tokenrouter_user_id,
+                            debit_user_id=target_binding.tokenrouter_user_id,
+                            credit_user_id=(
+                                actor_binding.tokenrouter_user_id if won else None
+                            ),
+                            debit_units=amount_units,
+                            credit_units=amount_units,
+                            won=won,
+                            cooldown_seconds=self._robbery_cooldown_seconds,
+                        )
+                        operation = reservation.operation
+        except GameCooldownActive as exc:
+            yield event.plain_result(
+                f"打劫冷却中，请在 {exc.retry_after_seconds} 秒后再试。"
+            )
+            return
+        except BindingDatabaseError as exc:
+            logger.error("FAPI 查询打劫绑定关系失败：%s", exc)
+            yield event.plain_result("远程绑定数据库暂时不可用，请稍后重试。")
+            return
+        except (GameDatabaseError, GameOperationConflict) as exc:
+            logger.error("FAPI 预留打劫操作失败：%s", exc)
+            yield event.plain_result("游戏数据库暂时不可用，请稍后重试。")
+            return
+
+        if early_reply:
+            yield event.plain_result(early_reply)
+            return
+        settled = await self._settle_game_operation(operation)
+        yield event.plain_result(self._game_reply(settled))
+
+    @fapi.command("老虎机", alias={"slot"})
+    async def slot_machine(self, event: AstrMessageEvent):
+        """扣除固定投入并按配置概率派发固定奖金。"""
+        command_context, context_error = self._group_command_context(event)
+        if context_error:
+            yield event.plain_result(context_error)
+            return
+        assert command_context is not None
+        if self._game_config_error:
+            yield event.plain_result("游戏配置不正确，请联系管理员检查插件配置。")
+            return
+        if not self._slot_enabled:
+            yield event.plain_result("老虎机功能当前未开启。")
+            return
+
+        operation_key = self._game_operation_key(
+            event,
+            command_context,
+            "slots",
+        )
+        if operation_key is None:
+            yield event.plain_result("无法确认当前消息编号，为避免重复扣款，本次操作已取消。")
+            return
+
+        early_reply = ""
+        try:
+            async with self._game_command_lock:
+                operation = await self.games.get_by_key(operation_key)
+                if operation is None:
+                    binding = await self.bindings.get_by_qq(
+                        command_context.sender_id
+                    )
+                    if binding is None:
+                        early_reply = (
+                            "当前账号尚未绑定中转站账号，请先使用 /fapi 绑定。"
+                        )
+                    else:
+                        won = roll_success(self._slot_success_rate)
+                        reservation = await self.games.reserve_game(
+                            operation_key=operation_key,
+                            game_type="slots",
+                            group_id=command_context.group_id,
+                            actor_qq_id=command_context.sender_id,
+                            actor_user_id=binding.tokenrouter_user_id,
+                            debit_user_id=binding.tokenrouter_user_id,
+                            credit_user_id=(
+                                binding.tokenrouter_user_id if won else None
+                            ),
+                            debit_units=self._slot_cost_units,
+                            credit_units=self._slot_prize_units if won else 0,
+                            won=won,
+                            cooldown_seconds=self._slot_cooldown_seconds,
+                        )
+                        operation = reservation.operation
+        except GameCooldownActive as exc:
+            yield event.plain_result(
+                f"老虎机冷却中，请在 {exc.retry_after_seconds} 秒后再试。"
+            )
+            return
+        except BindingDatabaseError as exc:
+            logger.error("FAPI 查询老虎机绑定关系失败：%s", exc)
+            yield event.plain_result("远程绑定数据库暂时不可用，请稍后重试。")
+            return
+        except (GameDatabaseError, GameOperationConflict) as exc:
+            logger.error("FAPI 预留老虎机操作失败：%s", exc)
+            yield event.plain_result("游戏数据库暂时不可用，请稍后重试。")
+            return
+
+        if early_reply:
+            yield event.plain_result(early_reply)
+            return
+        settled = await self._settle_game_operation(operation)
+        yield event.plain_result(self._game_reply(settled))
+
     async def terminate(self) -> None:
+        if self._game_worker_task is not None:
+            self._game_worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._game_worker_task
+            self._game_worker_task = None
         if self._reward_worker_task is not None:
             self._reward_worker_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reward_worker_task
             self._reward_worker_task = None
+        await self.games.close()
         await self.rewards.close()
         await self.bindings.close()
         await self.client.close()
@@ -701,6 +940,197 @@ class FapiPlugin(Star):
             except Exception:
                 logger.exception("FAPI 奖励补发任务执行失败")
             await asyncio.sleep(15)
+
+    async def _settle_game_operation(
+        self,
+        operation: GameOperation,
+    ) -> GameOperation:
+        async with self._game_delivery_lock:
+            try:
+                current = await self.games.get(operation.operation_id)
+            except GameDatabaseError as exc:
+                logger.error("FAPI 读取游戏结算任务失败：%s", exc)
+                return operation
+            if current is None:
+                logger.error("FAPI 游戏结算任务不存在：%s", operation.operation_id)
+                return operation
+
+            for _ in range(3):
+                if current.status not in {
+                    GameStatus.PENDING_DEBIT,
+                    GameStatus.PENDING_CREDIT,
+                    GameStatus.PENDING_REFUND,
+                }:
+                    return current
+
+                if current.status == GameStatus.PENDING_DEBIT:
+                    user_id = current.debit_user_id
+                    amount_units = current.debit_units
+                    balance_operation = "subtract"
+                    phase = "debit"
+                elif current.status == GameStatus.PENDING_CREDIT:
+                    if current.credit_user_id is None:
+                        logger.error(
+                            "FAPI 游戏派奖任务缺少收款用户：operation=%s",
+                            current.operation_id,
+                        )
+                        await self.games.mark_pending_refund(current.operation_id)
+                        current = await self._reload_game(current)
+                        continue
+                    user_id = current.credit_user_id
+                    amount_units = current.credit_units
+                    balance_operation = "add"
+                    phase = "credit"
+                else:
+                    user_id = current.debit_user_id
+                    amount_units = current.debit_units
+                    balance_operation = "add"
+                    phase = "refund"
+
+                try:
+                    await self.client.adjust_balance(
+                        user_id=user_id,
+                        amount=units_to_decimal(amount_units),
+                        operation=balance_operation,
+                        idempotency_key=(
+                            f"fapi-game:v1:{current.operation_id}:{phase}"
+                        ),
+                        notes=(
+                            f"FAPI game={current.game_type} phase={phase} "
+                            f"operation={current.operation_id}"
+                        ),
+                    )
+                except TokenRouterError as exc:
+                    logger.warning(
+                        "FAPI 游戏结算失败：operation=%s, phase=%s, "
+                        "status=%s, code=%s, error=%s",
+                        current.operation_id,
+                        phase,
+                        exc.status_code,
+                        exc.api_code,
+                        exc,
+                    )
+                    try:
+                        if phase == "debit" and is_insufficient_balance_error(exc):
+                            await self.games.mark_insufficient(current.operation_id)
+                        elif phase == "debit" and not self._retryable_game_error(exc):
+                            await self.games.mark_failed(current.operation_id)
+                        elif phase == "credit" and not self._retryable_game_error(exc):
+                            await self.games.mark_pending_refund(current.operation_id)
+                            current = await self._reload_game(current)
+                            continue
+                        else:
+                            await self.games.record_error(
+                                current.operation_id,
+                                str(exc),
+                                base_delay_seconds=self._game_retry_delay(exc),
+                            )
+                    except GameDatabaseError as store_exc:
+                        logger.error("FAPI 记录游戏结算错误失败：%s", store_exc)
+                    return await self._reload_game(current)
+                except Exception as exc:
+                    logger.exception("FAPI 游戏结算出现未预期错误")
+                    with contextlib.suppress(GameDatabaseError):
+                        await self.games.record_error(
+                            current.operation_id,
+                            str(exc),
+                        )
+                    return await self._reload_game(current)
+
+                try:
+                    if phase == "debit":
+                        await self.games.mark_debited(current.operation_id)
+                    elif phase == "credit":
+                        await self.games.mark_succeeded(current.operation_id)
+                    else:
+                        await self.games.mark_refunded(current.operation_id)
+                except GameDatabaseError:
+                    # 远端写入使用固定幂等键；保留旧状态后重试可安全补齐。
+                    logger.exception(
+                        "FAPI 游戏余额已调整但本地状态回写失败：operation=%s, phase=%s",
+                        current.operation_id,
+                        phase,
+                    )
+                    return current
+                current = await self._reload_game(current)
+            return current
+
+    async def _reload_game(self, fallback: GameOperation) -> GameOperation:
+        try:
+            return await self.games.get(fallback.operation_id) or fallback
+        except GameDatabaseError as exc:
+            logger.error("FAPI 重读游戏结算任务失败：%s", exc)
+            return fallback
+
+    async def _game_worker_loop(self) -> None:
+        while True:
+            try:
+                operations = await self.games.list_pending()
+                for operation in operations:
+                    await self._settle_game_operation(operation)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("FAPI 游戏结算补偿任务执行失败")
+            await asyncio.sleep(15)
+
+    @staticmethod
+    def _retryable_game_error(exc: TokenRouterError) -> bool:
+        return bool(
+            exc.outcome_unknown
+            or exc.status_code is None
+            or exc.status_code in {408, 409, 425, 429}
+            or exc.status_code >= 500
+        )
+
+    @staticmethod
+    def _game_retry_delay(exc: TokenRouterError) -> int:
+        if exc.retry_after is None:
+            return 5
+        return max(1, min(3600, math.ceil(exc.retry_after)))
+
+    @staticmethod
+    def _game_reply(operation: GameOperation) -> str:
+        pending = {
+            GameStatus.PENDING_DEBIT,
+            GameStatus.PENDING_CREDIT,
+            GameStatus.PENDING_REFUND,
+        }
+        if operation.game_type == "robbery":
+            if operation.status in pending:
+                return "打劫结果已锁定，余额正在结算，请稍后查询。"
+            if operation.status == GameStatus.INSUFFICIENT:
+                return "对方余额不足，本次打劫未得手。"
+            if operation.status == GameStatus.REFUNDED:
+                return "转账结算失败，扣除的金额已经退回对方账户。"
+            if operation.status == GameStatus.FAILED:
+                return "打劫结算失败，本次未扣款。"
+            if operation.won:
+                return (
+                    "打劫成功\n"
+                    f"获得：{FapiPlugin._format_units(operation.credit_units)}\n"
+                    "金额已从对方账户转入你的账户。"
+                )
+            return "打劫失败，本次没有余额变动。"
+
+        if operation.status in pending:
+            return "老虎机结果已锁定，余额正在结算，请稍后查询。"
+        if operation.status == GameStatus.INSUFFICIENT:
+            return "余额不足，无法支付本次老虎机投入。"
+        if operation.status == GameStatus.REFUNDED:
+            return "老虎机结算失败，本次投入已经退回账户。"
+        if operation.status == GameStatus.FAILED:
+            return "老虎机结算失败，本次未扣款。"
+        if operation.won:
+            return (
+                "老虎机中奖\n"
+                f"投入：{FapiPlugin._format_units(operation.debit_units)}\n"
+                f"奖金：{FapiPlugin._format_units(operation.credit_units)}"
+            )
+        return (
+            "老虎机未中奖\n"
+            f"本次投入：{FapiPlugin._format_units(operation.debit_units)}"
+        )
 
     @staticmethod
     def _checkin_success_reply(reservation: CheckinReservation) -> str:
@@ -805,6 +1235,21 @@ class FapiPlugin(Star):
         platform: str,
         group_id: str,
     ) -> str | None:
+        digest = FapiPlugin._operation_key(
+            event,
+            platform,
+            group_id,
+            "",
+        )
+        return f"fapi-red-packet:v1:{digest}" if digest else None
+
+    @staticmethod
+    def _operation_key(
+        event: AstrMessageEvent,
+        platform: str,
+        group_id: str,
+        operation_type: str,
+    ) -> str | None:
         message_obj = getattr(event, "message_obj", None)
         message_id = str(getattr(message_obj, "message_id", "") or "").strip()
         raw = getattr(message_obj, "raw_message", None)
@@ -817,11 +1262,108 @@ class FapiPlugin(Star):
             except Exception:
                 return None
         if message_id:
-            digest = hashlib.sha256(
-                f"{platform}\0{group_id}\0{message_id}".encode("utf-8")
-            ).hexdigest()
-            return f"fapi-red-packet:v1:{digest}"
+            payload = f"{platform}\0{group_id}\0{message_id}"
+            if operation_type:
+                payload = f"{operation_type}\0{payload}"
+            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            return digest
         return None
+
+    @staticmethod
+    def _game_operation_key(
+        event: AstrMessageEvent,
+        command_context: GroupCommandContext,
+        game_type: str,
+    ) -> str | None:
+        digest = FapiPlugin._operation_key(
+            event,
+            command_context.platform,
+            command_context.group_id,
+            game_type,
+        )
+        return f"fapi-game:v1:{game_type}:{digest}" if digest else None
+
+    @staticmethod
+    def _mentioned_target_id(
+        event: AstrMessageEvent,
+        command_context: GroupCommandContext,
+    ) -> str | None:
+        sender_id = command_context.sender_id
+        message_obj = getattr(event, "message_obj", None)
+        raw = getattr(message_obj, "raw_message", None)
+        candidates: set[str] = set()
+
+        get_self_id = getattr(event, "get_self_id", None)
+        try:
+            self_id = str(get_self_id() or "").strip() if callable(get_self_id) else ""
+        except Exception:
+            self_id = ""
+        if not self_id:
+            self_id = str(getattr(message_obj, "self_id", "") or "").strip()
+
+        if command_context.platform == "qq_official":
+            mentions = FapiPlugin._object_field(raw, "mentions") or []
+            raw_data = FapiPlugin._object_field(raw, "raw_data")
+            if not mentions and isinstance(raw_data, dict):
+                mentions = raw_data.get("mentions") or []
+            for mention in mentions:
+                is_you = FapiPlugin._object_field(mention, "is_you")
+                if is_you is True:
+                    continue
+                member_openid = str(
+                    FapiPlugin._object_field(mention, "member_openid") or ""
+                ).strip()
+                mention_id = str(
+                    FapiPlugin._object_field(mention, "id") or ""
+                ).strip()
+                if member_openid and mention_id and member_openid != mention_id:
+                    return None
+                target_id = member_openid or mention_id
+                if FapiPlugin._valid_platform_identifier(target_id):
+                    candidates.add(target_id)
+        else:
+            get_messages = getattr(event, "get_messages", None)
+            try:
+                components = list(get_messages() or []) if callable(get_messages) else []
+            except Exception:
+                components = []
+            if not components:
+                components = list(getattr(message_obj, "message", None) or [])
+            for component in components:
+                component_type = getattr(component, "type", "")
+                component_type = getattr(component_type, "value", component_type)
+                if (
+                    str(component_type).casefold() != "at"
+                    and component.__class__.__name__.casefold() != "at"
+                ):
+                    continue
+                target_id = str(getattr(component, "qq", "") or "").strip()
+                if FapiPlugin._valid_platform_identifier(target_id):
+                    candidates.add(target_id)
+
+            if isinstance(raw, dict):
+                for segment in raw.get("message") or []:
+                    if not isinstance(segment, dict) or segment.get("type") != "at":
+                        continue
+                    data = segment.get("data")
+                    if not isinstance(data, dict):
+                        continue
+                    target_id = str(data.get("qq") or "").strip()
+                    if FapiPlugin._valid_platform_identifier(target_id):
+                        candidates.add(target_id)
+
+        candidates.discard("")
+        candidates.discard("all")
+        candidates.discard(sender_id)
+        if self_id:
+            candidates.discard(self_id)
+        return next(iter(candidates)) if len(candidates) == 1 else None
+
+    @staticmethod
+    def _object_field(value: object, field: str):
+        if isinstance(value, dict):
+            return value.get(field)
+        return getattr(value, field, None)
 
     @staticmethod
     def _looks_like_email(value: str) -> bool:

@@ -51,6 +51,12 @@ class TokenRouterRewardResult:
     amount: Decimal
 
 
+@dataclass(frozen=True, slots=True)
+class TokenRouterBalanceAdjustment:
+    user_id: int
+    balance: Decimal
+
+
 def resolve_exact_username_users(
     data: Any,
     expected_username: str,
@@ -159,6 +165,50 @@ def resolve_reward_result(
         redeem_code=code,
         user_id=user_id,
         amount=amount,
+    )
+
+
+def resolve_balance_adjustment(
+    data: Any,
+    *,
+    expected_user_id: int,
+) -> TokenRouterBalanceAdjustment:
+    if not isinstance(data, dict):
+        raise TokenRouterError(
+            "余额调整响应格式不正确",
+            api_code="BALANCE_RESPONSE_MISMATCH",
+            outcome_unknown=True,
+        )
+    user_id = _positive_int(data.get("id"))
+    try:
+        balance = Decimal(str(data.get("balance")))
+    except (InvalidOperation, ValueError):
+        balance = None
+    if (
+        user_id != expected_user_id
+        or balance is None
+        or not balance.is_finite()
+        or balance < 0
+    ):
+        raise TokenRouterError(
+            "余额调整响应与请求不一致",
+            api_code="BALANCE_RESPONSE_MISMATCH",
+            outcome_unknown=True,
+        )
+    return TokenRouterBalanceAdjustment(user_id=user_id, balance=balance)
+
+
+def is_insufficient_balance_error(exc: TokenRouterError) -> bool:
+    if str(exc.api_code or "").upper() in {
+        "BALANCE_NEGATIVE",
+        "INSUFFICIENT_BALANCE",
+    }:
+        return True
+    message = str(exc).casefold()
+    return exc.status_code == 400 and (
+        "balance cannot be negative" in message
+        or "insufficient balance" in message
+        or "余额不足" in message
     )
 
 
@@ -274,6 +324,45 @@ class TokenRouterClient:
             expected_user_id=user_id,
             expected_amount=decimal_amount,
         )
+
+    async def adjust_balance(
+        self,
+        *,
+        user_id: int,
+        amount: Decimal,
+        operation: str,
+        idempotency_key: str,
+        notes: str,
+    ) -> TokenRouterBalanceAdjustment:
+        if user_id <= 0:
+            raise TokenRouterError("TokenRouter 用户 ID 不正确")
+        try:
+            decimal_amount = Decimal(str(amount))
+        except (InvalidOperation, ValueError) as exc:
+            raise TokenRouterError("余额调整金额不正确") from exc
+        scaled_amount = decimal_amount * Decimal(100_000_000)
+        if (
+            not decimal_amount.is_finite()
+            or decimal_amount <= 0
+            or scaled_amount != scaled_amount.to_integral_value()
+        ):
+            raise TokenRouterError("余额调整金额不正确")
+        if operation not in {"add", "subtract"}:
+            raise TokenRouterError("余额调整操作不正确")
+        if not _valid_ascii_token(idempotency_key, minimum=3, maximum=128):
+            raise TokenRouterError("余额调整幂等键不正确")
+
+        data = await self._post(
+            f"/api/v1/admin/users/{user_id}/balance",
+            json={
+                "balance": float(decimal_amount),
+                "operation": operation,
+                "notes": notes,
+            },
+            headers={"Idempotency-Key": idempotency_key},
+            outcome_unknown_on_transport=True,
+        )
+        return resolve_balance_adjustment(data, expected_user_id=user_id)
 
     async def _get(
         self,
