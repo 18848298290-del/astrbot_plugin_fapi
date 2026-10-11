@@ -39,7 +39,10 @@ from .reward_store import (
 )
 from .tokenrouter_client import (
     TokenRouterClient,
+    TokenRouterDashboardOverview,
     TokenRouterError,
+    TokenRouterUserRanking,
+    TokenRouterUserRPMStatus,
     TokenRouterUser,
     is_insufficient_balance_error,
 )
@@ -67,7 +70,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和余额游戏",
-    "3.6.0",
+    "3.7.0",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -311,15 +314,29 @@ class FapiPlugin(Star):
             )
             yield event.plain_result(
                 "FAPI 管理员私聊菜单\n"
+                "/fapi 管理 概览\n"
+                "/fapi 管理 RPM [用户名]\n"
+                "/fapi 管理 排行 [数量]\n"
                 "/fapi 管理 查询 <用户名>\n"
                 "/fapi 管理 加余额 <用户名> <金额>\n"
                 "/fapi 管理 减余额 <用户名> <金额>\n\n"
-                "用户名必须完全一致；余额操作单次上限："
+                "排行默认 10 人、最多 20 人；用户名必须完全一致；"
+                "余额操作单次上限："
                 f"{adjustment_limit}"
             )
             return
 
         action_aliases = {
+            "概览": "overview",
+            "今日概览": "overview",
+            "全日概览": "overview",
+            "全站概览": "overview",
+            "overview": "overview",
+            "rpm": "rpm",
+            "排行": "ranking",
+            "排名": "ranking",
+            "ranking": "ranking",
+            "rank": "ranking",
             "查询": "query",
             "用户": "query",
             "query": "query",
@@ -337,9 +354,94 @@ class FapiPlugin(Star):
             yield event.plain_result("未知管理操作，请发送 /fapi 管理。")
             return
 
+        if operation == "overview":
+            if username or amount:
+                yield event.plain_result("用法：/fapi 管理 概览")
+                return
+            try:
+                overview = await self.client.get_dashboard_overview()
+            except TokenRouterError as exc:
+                logger.warning(
+                    "FAPI 管理员查询全站概览失败：status=%s, code=%s, error=%s",
+                    exc.status_code,
+                    exc.api_code,
+                    exc,
+                )
+                yield event.plain_result(self._admin_read_error_reply(exc))
+                return
+            except Exception:
+                logger.exception("FAPI 管理员查询全站概览出现未预期错误")
+                yield event.plain_result("管理数据查询暂时不可用，请稍后重试。")
+                return
+            yield event.plain_result(self._dashboard_overview_reply(overview))
+            return
+
+        if operation == "ranking":
+            if amount:
+                yield event.plain_result("用法：/fapi 管理 排行 [数量]")
+                return
+            raw_limit = username.strip()
+            try:
+                ranking_limit = 10 if not raw_limit else int(raw_limit)
+            except ValueError:
+                ranking_limit = 0
+            if not 1 <= ranking_limit <= 20:
+                yield event.plain_result("排行数量必须是 1 到 20 的整数。")
+                return
+            ranking_date = datetime.now(self._admin_stats_timezone()).date().isoformat()
+            try:
+                ranking = await self.client.get_user_spending_ranking(
+                    ranking_date=ranking_date,
+                    timezone_name=self._admin_stats_timezone_name(),
+                    limit=ranking_limit,
+                )
+            except TokenRouterError as exc:
+                logger.warning(
+                    "FAPI 管理员查询用户排行失败：status=%s, code=%s, error=%s",
+                    exc.status_code,
+                    exc.api_code,
+                    exc,
+                )
+                yield event.plain_result(self._admin_read_error_reply(exc))
+                return
+            except Exception:
+                logger.exception("FAPI 管理员查询用户排行出现未预期错误")
+                yield event.plain_result("管理数据查询暂时不可用，请稍后重试。")
+                return
+            yield event.plain_result(self._user_ranking_reply(ranking))
+            return
+
+        if operation == "rpm" and amount:
+            yield event.plain_result("用法：/fapi 管理 RPM [用户名]")
+            return
+
+        if operation == "rpm" and not username.strip():
+            try:
+                overview = await self.client.get_dashboard_overview()
+            except TokenRouterError as exc:
+                logger.warning(
+                    "FAPI 管理员查询全站 RPM 失败：status=%s, code=%s, error=%s",
+                    exc.status_code,
+                    exc.api_code,
+                    exc,
+                )
+                yield event.plain_result(self._admin_read_error_reply(exc))
+                return
+            except Exception:
+                logger.exception("FAPI 管理员查询全站 RPM 出现未预期错误")
+                yield event.plain_result("管理数据查询暂时不可用，请稍后重试。")
+                return
+            yield event.plain_result(
+                "全站实时吞吐（近5分钟均值）\n"
+                f"RPM：{overview.rpm:,}\n"
+                f"TPM：{overview.tpm:,}\n"
+                f"当前小时活跃用户：{overview.hourly_active_users:,}"
+            )
+            return
+
         amount_units = 0
         idempotency_key = ""
-        if operation != "query":
+        if operation in {"add", "subtract"}:
             if self._admin_config_error:
                 yield event.plain_result("管理员余额配置不正确，请检查插件配置。")
                 return
@@ -371,6 +473,27 @@ class FapiPlugin(Star):
             yield event.plain_result(user_error)
             return
         assert user is not None
+
+        if operation == "rpm":
+            try:
+                rpm_status = await self.client.get_user_rpm_status(user.user_id)
+            except TokenRouterError as exc:
+                logger.warning(
+                    "FAPI 管理员查询用户 RPM 失败：user=%s, status=%s, "
+                    "code=%s, error=%s",
+                    user.user_id,
+                    exc.status_code,
+                    exc.api_code,
+                    exc,
+                )
+                yield event.plain_result(self._admin_read_error_reply(exc))
+                return
+            except Exception:
+                logger.exception("FAPI 管理员查询用户 RPM 出现未预期错误")
+                yield event.plain_result("管理数据查询暂时不可用，请稍后重试。")
+                return
+            yield event.plain_result(self._user_rpm_reply(user, rpm_status))
+            return
 
         if operation == "query":
             try:
@@ -1636,6 +1759,94 @@ class FapiPlugin(Star):
         )
         return text[:maximum]
 
+    def _admin_stats_timezone(self):
+        return getattr(self, "_reward_timezone", timezone.utc)
+
+    def _admin_stats_timezone_name(self) -> str:
+        zone = self._admin_stats_timezone()
+        return str(getattr(zone, "key", "UTC"))
+
+    @staticmethod
+    def _dashboard_overview_reply(overview: TokenRouterDashboardOverview) -> str:
+        freshness = "\n统计状态：聚合数据可能延迟" if overview.stats_stale else ""
+        return (
+            "今日全站概览（按中转站统计日）\n"
+            f"请求：{overview.today_requests:,}\n"
+            f"Token：{overview.today_tokens:,}\n"
+            f"实际消费：{FapiPlugin._format_usd(overview.today_actual_cost)}\n"
+            f"活跃用户：{overview.active_users:,} / 总用户 {overview.total_users:,}\n"
+            f"今日新增用户：{overview.today_new_users:,}\n"
+            f"API Key：活跃 {overview.active_api_keys:,} / 总计 "
+            f"{overview.total_api_keys:,}\n"
+            f"近5分钟：RPM {overview.rpm:,} / TPM {overview.tpm:,}\n"
+            f"平均响应：{overview.average_duration_ms:,.2f} ms\n"
+            f"{overview.resource_kind}：正常 {overview.normal_resources:,} / "
+            f"异常 {overview.error_resources:,} / 限流 "
+            f"{overview.rate_limit_resources:,} / 过载 "
+            f"{overview.overload_resources:,} / 总计 {overview.total_resources:,}"
+            f"{freshness}"
+        )
+
+    @staticmethod
+    def _rpm_usage_text(used: int, limit: int) -> str:
+        return f"{used:,} / {'不限' if limit == 0 else f'{limit:,}'}"
+
+    @staticmethod
+    def _user_rpm_reply(
+        user: TokenRouterUser,
+        status: TokenRouterUserRPMStatus,
+    ) -> str:
+        lines = [
+            "用户 RPM 状态（当前分钟）",
+            f"用户：{FapiPlugin._safe_reply_field(user.username, maximum=64)}"
+            f"（ID {user.user_id}）",
+            f"总 RPM：{FapiPlugin._rpm_usage_text(status.used, status.limit)}",
+        ]
+        if not status.per_group:
+            lines.append("分组：无绑定分组 API Key")
+            return "\n".join(lines)
+
+        lines.append("分组 RPM：")
+        shown_groups = status.per_group[:8]
+        source_labels = {"group": "分组", "override": "用户覆盖", "": "未知"}
+        for group in shown_groups:
+            group_name = FapiPlugin._safe_reply_field(
+                group.group_name or f"分组 {group.group_id}",
+                maximum=48,
+            )
+            lines.append(
+                f"- {group_name}："
+                f"{FapiPlugin._rpm_usage_text(group.used, group.limit)} "
+                f"({source_labels[group.source]})"
+            )
+        remaining = len(status.per_group) - len(shown_groups)
+        if remaining > 0:
+            lines.append(f"另有 {remaining} 个分组未显示")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _user_ranking_reply(ranking: TokenRouterUserRanking) -> str:
+        lines = [
+            f"用户消费排行（{ranking.start_date}）",
+            f"全站合计：{FapiPlugin._format_usd(ranking.total_actual_cost)} / "
+            f"{ranking.total_requests:,} 次请求 / {ranking.total_tokens:,} Token",
+        ]
+        if not ranking.items:
+            lines.append("今日暂无用户消费记录。")
+            return "\n".join(lines)
+
+        for index, item in enumerate(ranking.items, start=1):
+            username = FapiPlugin._safe_reply_field(
+                item.username or f"用户 {item.user_id}",
+                maximum=32,
+            )
+            lines.append(
+                f"{index}. {username}（ID {item.user_id}） "
+                f"{FapiPlugin._format_usd(item.actual_cost)} / "
+                f"{item.requests:,} 次 / {item.tokens:,} Token"
+            )
+        return "\n".join(lines)
+
     def _group_command_context(
         self,
         event: AstrMessageEvent,
@@ -1925,3 +2136,13 @@ class FapiPlugin(Star):
         if exc.status_code == 429:
             return "中转站请求太频繁，本次余额调整未完成，请稍后再试。"
         return "中转站余额调整失败，本次操作未完成。"
+
+    @staticmethod
+    def _admin_read_error_reply(exc: TokenRouterError) -> str:
+        if exc.status_code in {401, 403}:
+            return "中转站鉴权失败，请检查插件配置。"
+        if exc.status_code == 429:
+            return "中转站查询太频繁，请稍后再试。"
+        if exc.status_code == 501 or str(exc.api_code or "").upper() == "RPM_STATUS_UNAVAILABLE":
+            return "中转站 RPM 状态服务当前不可用。"
+        return "管理数据查询暂时不可用，请稍后重试。"

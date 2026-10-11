@@ -355,6 +355,9 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(replies), 1)
         self.assertIn("FAPI 管理员私聊菜单", replies[0])
+        self.assertIn("/fapi 管理 概览", replies[0])
+        self.assertIn("/fapi 管理 RPM [用户名]", replies[0])
+        self.assertIn("/fapi 管理 排行 [数量]", replies[0])
         self.assertIn("/fapi 管理 查询 <用户名>", replies[0])
         self.assertIn("USD 1,000.00", replies[0])
 
@@ -426,6 +429,135 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("余额：USD 12.50", replies[0])
         self.assertIn("已使用（近30天）：USD 3.25", replies[0])
         self.assertIn("并发上限：8", replies[0])
+
+    async def test_private_admin_queries_overview_and_global_rpm(self):
+        class Client:
+            async def get_dashboard_overview(_self):
+                return SimpleNamespace(
+                    total_users=50,
+                    today_new_users=2,
+                    active_users=9,
+                    hourly_active_users=3,
+                    total_api_keys=20,
+                    active_api_keys=18,
+                    today_requests=1234,
+                    today_tokens=567890,
+                    today_actual_cost=Decimal("12.3456"),
+                    rpm=8,
+                    tpm=900,
+                    average_duration_ms=321.5,
+                    resource_kind="提供商",
+                    total_resources=6,
+                    normal_resources=4,
+                    error_resources=1,
+                    rate_limit_resources=1,
+                    overload_resources=0,
+                    stats_stale=False,
+                )
+
+        self.plugin.client = Client()
+        event = FakeEvent(group_id=None, astrbot_admin=True)
+
+        overview = await collect(self.plugin.admin_private(event, "概览"))
+        rpm = await collect(self.plugin.admin_private(event, "RPM"))
+
+        self.assertIn("今日全站概览", overview[0])
+        self.assertIn("请求：1,234", overview[0])
+        self.assertIn("实际消费：USD 12.3456", overview[0])
+        self.assertIn("RPM 8 / TPM 900", overview[0])
+        self.assertIn("全站实时吞吐（近5分钟均值）", rpm[0])
+        self.assertIn("RPM：8", rpm[0])
+
+    async def test_private_admin_queries_user_rpm_and_limits_group_output(self):
+        class Client:
+            async def find_users_by_exact_username(_self, username):
+                self.assertEqual(username, "alice")
+                return [user(7, "alice", "alice@example.com")]
+
+            async def get_user_rpm_status(_self, user_id):
+                self.assertEqual(user_id, 7)
+                groups = tuple(
+                    SimpleNamespace(
+                        group_id=index,
+                        group_name=f"group-{index}",
+                        used=index,
+                        limit=0 if index == 1 else 20,
+                        source="override" if index == 1 else "group",
+                    )
+                    for index in range(1, 11)
+                )
+                return SimpleNamespace(used=4, limit=0, per_group=groups)
+
+        self.plugin.client = Client()
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=True),
+                "RPM",
+                "alice",
+            )
+        )
+
+        self.assertIn("用户 RPM 状态（当前分钟）", replies[0])
+        self.assertIn("总 RPM：4 / 不限", replies[0])
+        self.assertIn("group-1：1 / 不限 (用户覆盖)", replies[0])
+        self.assertIn("另有 2 个分组未显示", replies[0])
+        self.assertNotIn("group-9", replies[0])
+
+    async def test_private_admin_queries_today_ranking_without_email(self):
+        class Client:
+            def __init__(_self):
+                _self.values = None
+
+            async def get_user_spending_ranking(_self, **values):
+                _self.values = values
+                return SimpleNamespace(
+                    start_date=values["ranking_date"],
+                    end_date=values["ranking_date"],
+                    total_actual_cost=Decimal("5.5"),
+                    total_requests=20,
+                    total_tokens=3000,
+                    items=(
+                        SimpleNamespace(
+                            user_id=7,
+                            username="alice\nspoofed",
+                            actual_cost=Decimal("3.25"),
+                            requests=12,
+                            tokens=2000,
+                        ),
+                    ),
+                )
+
+        client = Client()
+        self.plugin.client = client
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=True),
+                "排行",
+                "5",
+            )
+        )
+
+        self.assertEqual(client.values["limit"], 5)
+        self.assertEqual(client.values["timezone_name"], "Asia/Shanghai")
+        self.assertIn("用户消费排行", replies[0])
+        self.assertIn("alice spoofed", replies[0])
+        self.assertNotIn("@example.com", replies[0])
+
+    async def test_private_admin_rejects_invalid_ranking_limit_before_api(self):
+        class ForbiddenClient:
+            async def get_user_spending_ranking(_self, **_values):
+                raise AssertionError("非法排行数量不应发起请求")
+
+        self.plugin.client = ForbiddenClient()
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=True),
+                "排行",
+                "21",
+            )
+        )
+
+        self.assertEqual(replies, ["排行数量必须是 1 到 20 的整数。"])
 
     async def test_private_admin_refuses_duplicate_exact_username(self):
         class Client:

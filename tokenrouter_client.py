@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal, InvalidOperation
 import math
 from typing import Any
@@ -55,6 +56,65 @@ class TokenRouterRewardResult:
 class TokenRouterBalanceAdjustment:
     user_id: int
     balance: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class TokenRouterDashboardOverview:
+    total_users: int
+    today_new_users: int
+    active_users: int
+    hourly_active_users: int
+    total_api_keys: int
+    active_api_keys: int
+    today_requests: int
+    today_tokens: int
+    today_actual_cost: Decimal
+    rpm: int
+    tpm: int
+    average_duration_ms: float
+    resource_kind: str
+    total_resources: int
+    normal_resources: int
+    error_resources: int
+    rate_limit_resources: int
+    overload_resources: int
+    stats_updated_at: str
+    stats_stale: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TokenRouterRPMGroupStatus:
+    group_id: int
+    group_name: str
+    used: int
+    limit: int
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
+class TokenRouterUserRPMStatus:
+    used: int
+    limit: int
+    per_group: tuple[TokenRouterRPMGroupStatus, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TokenRouterRankingItem:
+    user_id: int
+    username: str
+    actual_cost: Decimal
+    requests: int
+    tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class TokenRouterUserRanking:
+    start_date: str
+    end_date: str
+    total_actual_cost: Decimal
+    total_requests: int
+    total_tokens: int
+    items: tuple[TokenRouterRankingItem, ...]
 
 
 def resolve_exact_username_users(
@@ -198,6 +258,196 @@ def resolve_balance_adjustment(
     return TokenRouterBalanceAdjustment(user_id=user_id, balance=balance)
 
 
+def resolve_dashboard_overview(data: Any) -> TokenRouterDashboardOverview:
+    if not isinstance(data, dict):
+        raise TokenRouterError("全站概览响应格式不正确")
+
+    integer_fields = {
+        name: _non_negative_int(data.get(name))
+        for name in (
+            "total_users",
+            "today_new_users",
+            "active_users",
+            "hourly_active_users",
+            "total_api_keys",
+            "active_api_keys",
+            "today_requests",
+            "today_tokens",
+            "rpm",
+            "tpm",
+        )
+    }
+    if any(value is None for value in integer_fields.values()):
+        raise TokenRouterError("全站概览响应缺少有效统计字段")
+
+    today_actual_cost = _non_negative_decimal(data.get("today_actual_cost"))
+    average_duration_ms = _finite_float(data.get("average_duration_ms"))
+    if today_actual_cost is None or average_duration_ms is None or average_duration_ms < 0:
+        raise TokenRouterError("全站概览响应缺少有效费用或耗时字段")
+
+    resource_kind = "提供商"
+    resource_prefix = "providers"
+    if "total_providers" not in data and "total_accounts" in data:
+        resource_kind = "账户"
+        resource_prefix = "accounts"
+    resource_fields = {
+        "total": _non_negative_int(data.get(f"total_{resource_prefix}")),
+        "normal": _non_negative_int(data.get(f"normal_{resource_prefix}")),
+        "error": _non_negative_int(data.get(f"error_{resource_prefix}")),
+        "rate_limit": _non_negative_int(data.get(f"ratelimit_{resource_prefix}")),
+        "overload": _non_negative_int(data.get(f"overload_{resource_prefix}")),
+    }
+    if any(value is None for value in resource_fields.values()):
+        raise TokenRouterError("全站概览响应缺少有效资源状态字段")
+
+    stats_updated_at = data.get("stats_updated_at", "")
+    stats_stale = data.get("stats_stale", False)
+    if not isinstance(stats_updated_at, str) or not isinstance(stats_stale, bool):
+        raise TokenRouterError("全站概览响应的新鲜度字段不正确")
+
+    return TokenRouterDashboardOverview(
+        total_users=integer_fields["total_users"],
+        today_new_users=integer_fields["today_new_users"],
+        active_users=integer_fields["active_users"],
+        hourly_active_users=integer_fields["hourly_active_users"],
+        total_api_keys=integer_fields["total_api_keys"],
+        active_api_keys=integer_fields["active_api_keys"],
+        today_requests=integer_fields["today_requests"],
+        today_tokens=integer_fields["today_tokens"],
+        today_actual_cost=today_actual_cost,
+        rpm=integer_fields["rpm"],
+        tpm=integer_fields["tpm"],
+        average_duration_ms=average_duration_ms,
+        resource_kind=resource_kind,
+        total_resources=resource_fields["total"],
+        normal_resources=resource_fields["normal"],
+        error_resources=resource_fields["error"],
+        rate_limit_resources=resource_fields["rate_limit"],
+        overload_resources=resource_fields["overload"],
+        stats_updated_at=stats_updated_at,
+        stats_stale=stats_stale,
+    )
+
+
+def resolve_user_rpm_status(data: Any) -> TokenRouterUserRPMStatus:
+    if not isinstance(data, dict):
+        raise TokenRouterError("用户 RPM 响应格式不正确")
+    used = _non_negative_int(data.get("user_rpm_used"))
+    limit = _non_negative_int(data.get("user_rpm_limit"))
+    raw_groups = data.get("per_group")
+    if (
+        used is None
+        or limit is None
+        or (raw_groups is not None and not isinstance(raw_groups, list))
+    ):
+        raise TokenRouterError("用户 RPM 响应缺少有效字段")
+
+    groups: list[TokenRouterRPMGroupStatus] = []
+    seen_group_ids: set[int] = set()
+    for raw_group in raw_groups or []:
+        if not isinstance(raw_group, dict):
+            raise TokenRouterError("用户 RPM 分组响应格式不正确")
+        group_id = _positive_int(raw_group.get("group_id"))
+        group_name = raw_group.get("group_name")
+        group_used = _non_negative_int(raw_group.get("used"))
+        group_limit = _non_negative_int(raw_group.get("limit"))
+        source = raw_group.get("source")
+        if (
+            group_id is None
+            or group_id in seen_group_ids
+            or not isinstance(group_name, str)
+            or group_used is None
+            or group_limit is None
+            or not isinstance(source, str)
+            or source not in {"", "group", "override"}
+        ):
+            raise TokenRouterError("用户 RPM 分组响应缺少有效字段")
+        seen_group_ids.add(group_id)
+        groups.append(
+            TokenRouterRPMGroupStatus(
+                group_id=group_id,
+                group_name=group_name,
+                used=group_used,
+                limit=group_limit,
+                source=source,
+            )
+        )
+    return TokenRouterUserRPMStatus(used=used, limit=limit, per_group=tuple(groups))
+
+
+def resolve_user_spending_ranking(
+    data: Any,
+    *,
+    expected_date: str,
+    maximum_items: int,
+) -> TokenRouterUserRanking:
+    try:
+        parsed_expected_date = date.fromisoformat(expected_date)
+    except (TypeError, ValueError) as exc:
+        raise TokenRouterError("用户排行日期不正确") from exc
+    if parsed_expected_date.isoformat() != expected_date:
+        raise TokenRouterError("用户排行日期不正确")
+    if (
+        isinstance(maximum_items, bool)
+        or not isinstance(maximum_items, int)
+        or maximum_items <= 0
+    ):
+        raise TokenRouterError("用户排行数量不正确")
+    if not isinstance(data, dict):
+        raise TokenRouterError("用户排行响应格式不正确")
+    raw_items = data.get("ranking")
+    if raw_items is None:
+        raw_items = []
+    if not isinstance(raw_items, list) or len(raw_items) > maximum_items:
+        raise TokenRouterError("用户排行响应条目数量不正确")
+    if data.get("start_date") != expected_date or data.get("end_date") != expected_date:
+        raise TokenRouterError("用户排行响应日期与请求不一致")
+
+    total_actual_cost = _non_negative_decimal(data.get("total_actual_cost"))
+    total_requests = _non_negative_int(data.get("total_requests"))
+    total_tokens = _non_negative_int(data.get("total_tokens"))
+    if total_actual_cost is None or total_requests is None or total_tokens is None:
+        raise TokenRouterError("用户排行响应缺少有效汇总字段")
+
+    items: list[TokenRouterRankingItem] = []
+    seen_user_ids: set[int] = set()
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            raise TokenRouterError("用户排行条目格式不正确")
+        user_id = _positive_int(raw_item.get("user_id"))
+        username = raw_item.get("username")
+        actual_cost = _non_negative_decimal(raw_item.get("actual_cost"))
+        requests = _non_negative_int(raw_item.get("requests"))
+        tokens = _non_negative_int(raw_item.get("tokens"))
+        if (
+            user_id is None
+            or user_id in seen_user_ids
+            or not isinstance(username, str)
+            or actual_cost is None
+            or requests is None
+            or tokens is None
+        ):
+            raise TokenRouterError("用户排行条目缺少有效字段")
+        seen_user_ids.add(user_id)
+        items.append(
+            TokenRouterRankingItem(
+                user_id=user_id,
+                username=username,
+                actual_cost=actual_cost,
+                requests=requests,
+                tokens=tokens,
+            )
+        )
+    return TokenRouterUserRanking(
+        start_date=expected_date,
+        end_date=expected_date,
+        total_actual_cost=total_actual_cost,
+        total_requests=total_requests,
+        total_tokens=total_tokens,
+        items=tuple(items),
+    )
+
+
 def is_insufficient_balance_error(exc: TokenRouterError) -> bool:
     if str(exc.api_code or "").upper() in {
         "BALANCE_NEGATIVE",
@@ -278,6 +528,50 @@ class TokenRouterClient:
             json={"user_ids": [user_id]},
         )
         return resolve_balance_summary(user_data, usage_data, user_id)
+
+    async def get_dashboard_overview(self) -> TokenRouterDashboardOverview:
+        data = await self._get("/api/v1/admin/dashboard/stats")
+        return resolve_dashboard_overview(data)
+
+    async def get_user_rpm_status(self, user_id: int) -> TokenRouterUserRPMStatus:
+        if user_id <= 0:
+            raise TokenRouterError("TokenRouter 用户 ID 不正确")
+        data = await self._get(f"/api/v1/admin/users/{user_id}/rpm-status")
+        return resolve_user_rpm_status(data)
+
+    async def get_user_spending_ranking(
+        self,
+        *,
+        ranking_date: str,
+        timezone_name: str,
+        limit: int,
+    ) -> TokenRouterUserRanking:
+        try:
+            parsed_date = date.fromisoformat(ranking_date)
+        except (TypeError, ValueError) as exc:
+            raise TokenRouterError("用户排行日期不正确") from exc
+        if parsed_date.isoformat() != ranking_date:
+            raise TokenRouterError("用户排行日期不正确")
+        normalized_timezone = timezone_name.strip()
+        if not normalized_timezone or len(normalized_timezone) > 64:
+            raise TokenRouterError("用户排行时区不正确")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+            raise TokenRouterError("用户排行数量必须在 1 到 50 之间")
+
+        data = await self._get(
+            "/api/v1/admin/dashboard/users-ranking",
+            params={
+                "start_date": ranking_date,
+                "end_date": ranking_date,
+                "timezone": normalized_timezone,
+                "limit": limit,
+            },
+        )
+        return resolve_user_spending_ranking(
+            data,
+            expected_date=ranking_date,
+            maximum_items=limit,
+        )
 
     async def create_and_redeem_reward(
         self,
@@ -472,9 +766,12 @@ def _positive_int(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
     try:
-        parsed = int(value)
-    except (TypeError, ValueError):
+        decimal_value = Decimal(str(value))
+    except (InvalidOperation, ValueError):
         return None
+    if not decimal_value.is_finite() or decimal_value != decimal_value.to_integral_value():
+        return None
+    parsed = int(decimal_value)
     return parsed if parsed > 0 else None
 
 
@@ -482,10 +779,23 @@ def _non_negative_int(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
     try:
-        parsed = int(value)
-    except (TypeError, ValueError):
+        decimal_value = Decimal(str(value))
+    except (InvalidOperation, ValueError):
         return None
+    if not decimal_value.is_finite() or decimal_value != decimal_value.to_integral_value():
+        return None
+    parsed = int(decimal_value)
     return parsed if parsed >= 0 else None
+
+
+def _non_negative_decimal(value: Any) -> Decimal | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed.is_finite() and parsed >= 0 else None
 
 
 def _finite_float(value: Any) -> float | None:

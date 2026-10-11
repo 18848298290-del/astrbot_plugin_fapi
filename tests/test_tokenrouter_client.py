@@ -9,8 +9,11 @@ from tokenrouter_client import (
     is_insufficient_balance_error,
     resolve_balance_adjustment,
     resolve_balance_summary,
+    resolve_dashboard_overview,
     resolve_exact_username_users,
     resolve_reward_result,
+    resolve_user_rpm_status,
+    resolve_user_spending_ranking,
 )
 
 
@@ -227,6 +230,144 @@ class ResolveBalanceAdjustmentTest(unittest.TestCase):
                 TokenRouterError("service unavailable", status_code=503)
             )
         )
+
+
+class ResolveAdminMetricsTest(unittest.TestCase):
+    def test_resolves_dashboard_overview_with_provider_fields(self):
+        overview = resolve_dashboard_overview(
+            {
+                "total_users": 100,
+                "today_new_users": 3,
+                "active_users": 12,
+                "hourly_active_users": 4,
+                "total_api_keys": 30,
+                "active_api_keys": 25,
+                "today_requests": 1234,
+                "today_tokens": 567890,
+                "today_actual_cost": "12.3456",
+                "rpm": 8,
+                "tpm": 900,
+                "average_duration_ms": 321.5,
+                "total_providers": 9,
+                "normal_providers": 5,
+                "error_providers": 1,
+                "ratelimit_providers": 2,
+                "overload_providers": 1,
+                "stats_updated_at": "2026-10-11T01:02:03Z",
+                "stats_stale": False,
+            }
+        )
+
+        self.assertEqual(overview.today_requests, 1234)
+        self.assertEqual(overview.today_actual_cost, Decimal("12.3456"))
+        self.assertEqual(overview.resource_kind, "提供商")
+        self.assertEqual(overview.rpm, 8)
+
+    def test_dashboard_overview_accepts_account_compatibility_fields(self):
+        data = {
+            "total_users": 0,
+            "today_new_users": 0,
+            "active_users": 0,
+            "hourly_active_users": 0,
+            "total_api_keys": 0,
+            "active_api_keys": 0,
+            "today_requests": 0,
+            "today_tokens": 0,
+            "today_actual_cost": 0,
+            "rpm": 0,
+            "tpm": 0,
+            "average_duration_ms": 0,
+            "total_accounts": 2,
+            "normal_accounts": 1,
+            "error_accounts": 0,
+            "ratelimit_accounts": 1,
+            "overload_accounts": 0,
+        }
+
+        overview = resolve_dashboard_overview(data)
+
+        self.assertEqual(overview.resource_kind, "账户")
+        self.assertEqual(overview.total_resources, 2)
+
+    def test_dashboard_overview_rejects_fractional_counter(self):
+        with self.assertRaises(TokenRouterError):
+            resolve_dashboard_overview(
+                {
+                    "total_users": 1,
+                    "today_new_users": 0,
+                    "active_users": 1,
+                    "hourly_active_users": 1,
+                    "total_api_keys": 1,
+                    "active_api_keys": 1,
+                    "today_requests": 1.5,
+                    "today_tokens": 2,
+                    "today_actual_cost": 1,
+                    "rpm": 1,
+                    "tpm": 2,
+                    "average_duration_ms": 1,
+                    "total_providers": 1,
+                    "normal_providers": 1,
+                    "error_providers": 0,
+                    "ratelimit_providers": 0,
+                    "overload_providers": 0,
+                }
+            )
+
+    def test_resolves_user_rpm_and_null_groups(self):
+        unlimited = resolve_user_rpm_status(
+            {"user_rpm_used": 4, "user_rpm_limit": 0, "per_group": None}
+        )
+        grouped = resolve_user_rpm_status(
+            {
+                "user_rpm_used": 4,
+                "user_rpm_limit": 10,
+                "per_group": [
+                    {
+                        "group_id": 2,
+                        "group_name": "default",
+                        "used": 3,
+                        "limit": 5,
+                        "source": "override",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(unlimited.limit, 0)
+        self.assertEqual(unlimited.per_group, ())
+        self.assertEqual(grouped.per_group[0].source, "override")
+
+    def test_resolves_today_ranking_and_rejects_wrong_date(self):
+        data = {
+            "ranking": [
+                {
+                    "user_id": 7,
+                    "username": "alice",
+                    "actual_cost": "3.25",
+                    "requests": 12,
+                    "tokens": 3456,
+                }
+            ],
+            "total_actual_cost": "4.5",
+            "total_requests": 20,
+            "total_tokens": 5000,
+            "start_date": "2026-10-11",
+            "end_date": "2026-10-11",
+        }
+
+        ranking = resolve_user_spending_ranking(
+            data,
+            expected_date="2026-10-11",
+            maximum_items=10,
+        )
+
+        self.assertEqual(ranking.items[0].actual_cost, Decimal("3.25"))
+        with self.assertRaises(TokenRouterError):
+            resolve_user_spending_ranking(
+                {**data, "end_date": "2026-10-12"},
+                expected_date="2026-10-11",
+                maximum_items=10,
+            )
 
 
 class TokenRouterClientTest(unittest.IsolatedAsyncioTestCase):
@@ -559,6 +700,125 @@ class TokenRouterClientTest(unittest.IsolatedAsyncioTestCase):
             await client.close()
         self.assertEqual(raised.exception.status_code, 401)
         self.assertEqual(raised.exception.api_code, "INVALID_ADMIN_KEY")
+
+    async def test_queries_dashboard_overview(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.method, "GET")
+            self.assertEqual(request.url.path, "/api/v1/admin/dashboard/stats")
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "message": "success",
+                    "data": {
+                        "total_users": 10,
+                        "today_new_users": 1,
+                        "active_users": 2,
+                        "hourly_active_users": 1,
+                        "total_api_keys": 6,
+                        "active_api_keys": 5,
+                        "today_requests": 20,
+                        "today_tokens": 300,
+                        "today_actual_cost": 1.5,
+                        "rpm": 4,
+                        "tpm": 60,
+                        "average_duration_ms": 100,
+                        "total_providers": 3,
+                        "normal_providers": 2,
+                        "error_providers": 1,
+                        "ratelimit_providers": 0,
+                        "overload_providers": 0,
+                        "stats_updated_at": "",
+                        "stats_stale": False,
+                    },
+                },
+            )
+
+        client = TokenRouterClient(
+            "https://tokenrouter.example.com",
+            "secret",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            overview = await client.get_dashboard_overview()
+        finally:
+            await client.close()
+
+        self.assertEqual(overview.rpm, 4)
+        self.assertEqual(overview.today_actual_cost, Decimal("1.5"))
+
+    async def test_queries_user_rpm_status(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.method, "GET")
+            self.assertEqual(request.url.path, "/api/v1/admin/users/7/rpm-status")
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "message": "success",
+                    "data": {
+                        "user_rpm_used": 2,
+                        "user_rpm_limit": 10,
+                        "per_group": [],
+                    },
+                },
+            )
+
+        client = TokenRouterClient(
+            "https://tokenrouter.example.com",
+            "secret",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            status = await client.get_user_rpm_status(7)
+        finally:
+            await client.close()
+
+        self.assertEqual(status.used, 2)
+        self.assertEqual(status.limit, 10)
+
+    async def test_queries_today_user_ranking_with_timezone(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.method, "GET")
+            self.assertEqual(
+                request.url.path,
+                "/api/v1/admin/dashboard/users-ranking",
+            )
+            self.assertEqual(request.url.params["start_date"], "2026-10-11")
+            self.assertEqual(request.url.params["end_date"], "2026-10-11")
+            self.assertEqual(request.url.params["timezone"], "Asia/Shanghai")
+            self.assertEqual(request.url.params["limit"], "10")
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "message": "success",
+                    "data": {
+                        "ranking": [],
+                        "total_actual_cost": 0,
+                        "total_requests": 0,
+                        "total_tokens": 0,
+                        "start_date": "2026-10-11",
+                        "end_date": "2026-10-11",
+                    },
+                },
+            )
+
+        client = TokenRouterClient(
+            "https://tokenrouter.example.com",
+            "secret",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            ranking = await client.get_user_spending_ranking(
+                ranking_date="2026-10-11",
+                timezone_name="Asia/Shanghai",
+                limit=10,
+            )
+        finally:
+            await client.close()
+
+        self.assertEqual(ranking.items, ())
 
 
 if __name__ == "__main__":
