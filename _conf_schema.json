@@ -170,7 +170,7 @@
   "slot_animation_enabled": {
     "description": "启用老虎机动画",
     "type": "bool",
-    "hint": "老虎机完成结算后先发送本地 GIF 动画，再显示最终结果。动画不参与开奖结果计算。",
+    "hint": "老虎机完成结算后先发送 emoji 转动提示，再显示最终结果。动画不参与开奖结果计算。",
     "default": true
   },
   "slot_cost": {

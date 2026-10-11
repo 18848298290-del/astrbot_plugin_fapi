@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import math
-from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from astrbot.api import AstrBotConfig, logger
@@ -46,8 +45,7 @@ from .tokenrouter_client import (
 
 _SUPPORTED_QQ_PLATFORMS = frozenset({"aiocqhttp", "qq_official"})
 _GAME_REFUND_MAX_ATTEMPTS = 5
-_SLOT_ANIMATION_PATH = Path(__file__).resolve().parent / "assets" / "slot_machine.gif"
-_SLOT_ANIMATION_DELAY_SECONDS = 1.5
+_SLOT_ANIMATION_DELAY_SECONDS = 1.2
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +59,7 @@ class GroupCommandContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和余额游戏",
-    "3.5.0",
+    "3.5.1",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -822,16 +820,6 @@ class FapiPlugin(Star):
             yield event.plain_result(early_reply)
             return
         settled = await self._settle_game_operation(operation)
-        if (
-            settled.game_type == "slots"
-            and self._slot_animation_enabled
-            and _SLOT_ANIMATION_PATH.is_file()
-        ):
-            try:
-                yield event.image_result(str(_SLOT_ANIMATION_PATH))
-                await asyncio.sleep(self._slot_animation_delay_seconds)
-            except Exception:
-                logger.exception("FAPI 老虎机动画构造失败")
         yield event.plain_result(self._game_reply(settled))
 
     @fapi.command("老虎机", alias={"slot"})
@@ -906,12 +894,12 @@ class FapiPlugin(Star):
             yield event.plain_result(early_reply)
             return
         settled = await self._settle_game_operation(operation)
-        if self._slot_animation_enabled and _SLOT_ANIMATION_PATH.is_file():
+        if self._slot_animation_enabled:
             try:
-                yield event.image_result(str(_SLOT_ANIMATION_PATH))
+                yield event.plain_result("🎰正在转动... 🔄 🔄 🔄")
                 await asyncio.sleep(self._slot_animation_delay_seconds)
             except Exception:
-                logger.exception("FAPI slot animation construction failed")
+                logger.exception("FAPI slot animation failed")
         yield event.plain_result(self._game_reply(settled))
 
     async def terminate(self) -> None:

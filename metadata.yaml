@@ -2,7 +2,7 @@ name: astrbot_plugin_fapi
 display_name: FAPI 账号互通
 short_desc: 在指定 QQ 群绑定 TokenRouter，并提供余额、签到、红包和余额游戏。
 desc: 支持 OneBot 与 QQ 官方机器人，所有操作限管理员配置的指定群，并通过远程 MySQL 保存绑定、奖励及游戏结算数据。
-version: 3.5.0
+version: 3.5.1
 author: FAPI
 repo: "https://github.com/18848298290-del/astrbot_plugin_fapi"
 astrbot_version: ">=4.28.2"

@@ -129,11 +129,6 @@ class FakeEvent:
     def plain_result(text):
         return text
 
-    @staticmethod
-    def image_result(path):
-        return ("image", path)
-
-
 async def collect(async_generator):
     return [item async for item in async_generator]
 
@@ -1153,17 +1148,15 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
         replies = await collect(self.plugin.slot_machine(FakeEvent()))
 
-        self.assertEqual(replies[0][0], "image")
-        self.assertEqual(Path(replies[0][1]).name, "slot_machine.gif")
+        self.assertEqual(replies[0], "🎰正在转动... 🔄 🔄 🔄")
         self.assertEqual(replies[1], "老虎机未中奖\n本次投入：USD 0.10")
 
-    async def test_slot_skips_animation_when_asset_is_missing(self):
+    async def test_slot_skips_animation_when_disabled(self):
         games = InMemoryGameStore(self.module)
         self.plugin.bindings = GameBindings({"12345": 11})
         self.plugin.games = games
         self.plugin.client = BalanceClient(self.module)
-        self.plugin._slot_animation_enabled = True
-        self.module._SLOT_ANIMATION_PATH = Path("missing-slot-animation.gif")
+        self.plugin._slot_animation_enabled = False
         self.module.roll_success = lambda _rate: False
 
         replies = await collect(self.plugin.slot_machine(FakeEvent()))
