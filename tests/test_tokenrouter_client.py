@@ -10,6 +10,7 @@ from tokenrouter_client import (
     resolve_balance_adjustment,
     resolve_balance_summary,
     resolve_dashboard_overview,
+    resolve_exact_email_users,
     resolve_exact_username_users,
     resolve_reward_result,
     resolve_user_rpm_status,
@@ -86,6 +87,60 @@ class ResolveExactUsernameUsersTest(unittest.TestCase):
         }
 
         users = resolve_exact_username_users({"items": [item, item]}, "alice")
+
+        self.assertEqual([user.user_id for user in users], [7])
+
+
+class ResolveExactEmailUsersTest(unittest.TestCase):
+    def test_requires_exact_email_after_fuzzy_search(self):
+        data = {
+            "items": [
+                {
+                    "id": 1,
+                    "username": "same-name",
+                    "email": "alice+old@example.com",
+                    "status": "active",
+                },
+                {
+                    "id": 2,
+                    "username": "same-name",
+                    "email": "alice@example.com",
+                    "status": "active",
+                },
+            ]
+        }
+
+        users = resolve_exact_email_users(data, "alice@example.com")
+
+        self.assertEqual([user.user_id for user in users], [2])
+        self.assertEqual(users[0].email, "alice@example.com")
+
+    def test_email_match_is_case_sensitive(self):
+        data = {
+            "items": [
+                {
+                    "id": 1,
+                    "username": "alice",
+                    "email": "Alice@Example.com",
+                    "status": "active",
+                }
+            ]
+        }
+
+        self.assertEqual(resolve_exact_email_users(data, "alice@example.com"), [])
+
+    def test_deduplicates_same_user_repeated_across_pages(self):
+        item = {
+            "id": 7,
+            "username": "alice",
+            "email": "alice@example.com",
+            "status": "active",
+        }
+
+        users = resolve_exact_email_users(
+            {"items": [item, item]},
+            "alice@example.com",
+        )
 
         self.assertEqual([user.user_id for user in users], [7])
 
@@ -675,6 +730,60 @@ class TokenRouterClientTest(unittest.IsolatedAsyncioTestCase):
         )
         try:
             users = await client.find_users_by_exact_username("alice")
+        finally:
+            await client.close()
+
+        self.assertEqual(requested_pages, [1, 2])
+        self.assertEqual([user.user_id for user in users], [7])
+
+    async def test_queries_users_by_email_across_all_pages(self):
+        requested_pages = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            page = int(request.url.params["page"])
+            requested_pages.append(page)
+            self.assertEqual(request.url.params["search"], "alice@example.com")
+            items = (
+                [
+                    {
+                        "id": 6,
+                        "username": "alice",
+                        "email": "alice+old@example.com",
+                        "status": "active",
+                    }
+                ]
+                if page == 1
+                else [
+                    {
+                        "id": 7,
+                        "username": "duplicate-name",
+                        "email": "alice@example.com",
+                        "status": "active",
+                    }
+                ]
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "message": "success",
+                    "data": {
+                        "items": items,
+                        "total": 2,
+                        "page": page,
+                        "page_size": 1,
+                        "pages": 2,
+                    },
+                },
+            )
+
+        client = TokenRouterClient(
+            "https://tokenrouter.example.com",
+            "secret",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            users = await client.find_users_by_exact_email("alice@example.com")
         finally:
             await client.close()
 

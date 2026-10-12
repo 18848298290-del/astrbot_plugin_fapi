@@ -93,7 +93,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和余额游戏",
-    "3.7.1",
+    "3.8.0",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -350,12 +350,12 @@ class FapiPlugin(Star):
             yield event.plain_result(
                 "FAPI 管理员私聊菜单\n"
                 "/fapi 管理 概览\n"
-                "/fapi 管理 RPM [用户名]\n"
+                "/fapi 管理 RPM [邮箱]\n"
                 "/fapi 管理 排行 [数量]\n"
-                "/fapi 管理 查询 <用户名>\n"
-                "/fapi 管理 加余额 <用户名> <金额>\n"
-                "/fapi 管理 减余额 <用户名> <金额>\n\n"
-                "排行默认 10 人、最多 20 人；用户名必须完全一致；"
+                "/fapi 管理 查询 <邮箱>\n"
+                "/fapi 管理 加余额 <邮箱> <金额>\n"
+                "/fapi 管理 减余额 <邮箱> <金额>\n\n"
+                "排行默认 10 人、最多 20 人；邮箱必须完全一致；"
                 "余额操作单次上限："
                 f"{adjustment_limit}"
             )
@@ -389,20 +389,20 @@ class FapiPlugin(Star):
             yield event.plain_result("未知管理操作，请发送 /fapi 管理。")
             return
 
-        username = ""
+        email = ""
         amount = ""
         if operation in {"query", "rpm"}:
-            username = arguments
+            email = arguments
         elif operation == "ranking":
-            username = arguments
+            email = arguments
         elif operation in {"add", "subtract"}:
-            username, separator, amount = arguments.rpartition(" ")
-            username = username.strip()
+            email, separator, amount = arguments.rpartition(" ")
+            email = email.strip()
             amount = amount.strip() if separator else ""
-            if not username or not amount:
+            if not email or not amount:
                 operation_name = "加余额" if operation == "add" else "减余额"
                 yield event.plain_result(
-                    f"用法：/fapi 管理 {operation_name} <用户名> <金额>"
+                    f"用法：/fapi 管理 {operation_name} <邮箱> <金额>"
                 )
                 return
         elif arguments:
@@ -434,7 +434,7 @@ class FapiPlugin(Star):
                     "排行时区配置不正确，请检查 reward_timezone。"
                 )
                 return
-            raw_limit = username.strip()
+            raw_limit = email.strip()
             try:
                 ranking_limit = 10 if not raw_limit else int(raw_limit)
             except ValueError:
@@ -466,10 +466,10 @@ class FapiPlugin(Star):
             return
 
         if operation == "rpm" and amount:
-            yield event.plain_result("用法：/fapi 管理 RPM [用户名]")
+            yield event.plain_result("用法：/fapi 管理 RPM [邮箱]")
             return
 
-        if operation == "rpm" and not username.strip():
+        if operation == "rpm" and not email.strip():
             try:
                 overview = await self.client.get_dashboard_overview()
             except TokenRouterError as exc:
@@ -522,7 +522,7 @@ class FapiPlugin(Star):
                 )
                 return
 
-        user, user_error = await self._resolve_private_admin_user(username)
+        user, user_error = await self._resolve_private_admin_user(email)
         if user_error:
             yield event.plain_result(user_error)
             return
@@ -569,8 +569,8 @@ class FapiPlugin(Star):
             yield event.plain_result(
                 "中转站用户\n"
                 f"ID：{user.user_id}\n"
-                f"用户名：{self._safe_reply_field(user.username)}\n"
                 f"邮箱：{self._safe_reply_field(user.email)}\n"
+                f"用户名：{self._safe_reply_field(user.username)}\n"
                 f"状态：{self._safe_reply_field(user.status or '未知')}\n"
                 f"余额：{self._format_usd(summary.balance)}\n"
                 f"已使用（近30天）：{self._format_usd(summary.used_last_30_days)}\n"
@@ -630,7 +630,8 @@ class FapiPlugin(Star):
         )
         yield event.plain_result(
             "余额调整成功\n"
-            f"用户：{self._safe_reply_field(user.username)}（ID {user.user_id}）\n"
+            f"邮箱：{self._safe_reply_field(user.email)}（ID {user.user_id}）\n"
+            f"用户名：{self._safe_reply_field(user.username)}\n"
             f"操作：{operation_name}\n"
             f"金额：{self._format_units(amount_units)}\n"
             f"调整后余额：{self._format_usd(result.balance)}"
@@ -646,12 +647,12 @@ class FapiPlugin(Star):
         assert command_context is not None
 
         if command_context.platform == "qq_official":
-            binding_usage = "/fapi 绑定 <用户名> <完整邮箱>"
+            binding_usage = "/fapi 绑定 <完整邮箱>"
             red_packet_permission = "红包创建：仅 AstrBot 管理员"
         else:
             binding_usage = (
-                "/fapi 绑定 <用户名>\n"
-                "/fapi 绑定 <用户名> <完整邮箱>"
+                "/fapi 绑定\n"
+                "/fapi 绑定 <完整邮箱>"
             )
             red_packet_permission = "红包创建：群主、群管理员或 AstrBot 管理员"
 
@@ -674,10 +675,10 @@ class FapiPlugin(Star):
     async def bind(
         self,
         event: AstrMessageEvent,
-        username: str = "",
         email: str = "",
+        extra: str = "",
     ):
-        """按精确用户名和邮箱绑定中转站账号。"""
+        """按唯一邮箱绑定中转站账号。"""
         command_context, context_error = self._group_command_context(event)
         if context_error:
             yield event.plain_result(context_error)
@@ -685,30 +686,26 @@ class FapiPlugin(Star):
         assert command_context is not None
         qq_id = command_context.sender_id
 
-        exact_username = username.strip()
-        if not exact_username:
-            yield event.plain_result(
-                "请输入用户名：/fapi 绑定 <用户名>\n"
-                "非 QQ 邮箱账号请使用：/fapi 绑定 <用户名> <完整邮箱>"
-            )
+        if extra.strip():
+            yield event.plain_result("绑定不再使用用户名，请使用：/fapi 绑定 <完整邮箱>")
             return
 
         supplied_email = email.strip()
         if not supplied_email and command_context.platform != "aiocqhttp":
             yield event.plain_result(
                 "QQ 官方机器人无法取得真实 QQ 号，请使用："
-                "/fapi 绑定 <用户名> <完整邮箱>"
+                "/fapi 绑定 <完整邮箱>"
             )
             return
         target_email = supplied_email or f"{qq_id}@qq.com"
-        if supplied_email and not self._looks_like_email(supplied_email):
+        if not self._looks_like_email(target_email):
             yield event.plain_result(
-                "邮箱格式不完整，请使用：/fapi 绑定 <用户名> <完整邮箱>"
+                "邮箱格式不完整，请使用：/fapi 绑定 <完整邮箱>"
             )
             return
 
         try:
-            users = await self.client.find_users_by_exact_username(exact_username)
+            users = await self.client.find_users_by_exact_email(target_email)
         except TokenRouterError as exc:
             logger.warning(
                 "FAPI 绑定查询失败：status=%s, code=%s, error=%s",
@@ -725,33 +722,16 @@ class FapiPlugin(Star):
 
         if not users:
             yield event.plain_result(
-                f"未找到用户名完全匹配“{exact_username}”的中转站用户，绑定已暂停。"
+                "未找到邮箱完全匹配的中转站用户，绑定已暂停。"
             )
             return
-
-        matches = [
-            user
-            for user in users
-            if user.email == target_email
-        ]
-        if not matches:
-            if not supplied_email:
-                yield event.plain_result(
-                    "该用户名存在，但邮箱不是当前 QQ 对应的 "
-                    f"{qq_id}@qq.com。请使用：/fapi 绑定 {exact_username} <完整邮箱>"
-                )
-            else:
-                yield event.plain_result(
-                    "用户名与邮箱未同时完全匹配同一个中转站用户，绑定已暂停。"
-                )
-            return
-        if len(matches) > 1:
+        if len(users) > 1:
             yield event.plain_result(
-                "存在多个用户名和邮箱均相同的中转站用户，无法安全绑定，请联系管理员。"
+                "存在多个相同邮箱的中转站用户，无法安全绑定，请联系管理员。"
             )
             return
 
-        user = matches[0]
+        user = users[0]
 
         try:
             result = await self.bindings.bind(
@@ -844,7 +824,7 @@ class FapiPlugin(Star):
             return
 
         yield event.plain_result(
-            f"用户名：{summary.username}\n"
+            f"邮箱：{self._mask_email(binding.email)}\n"
             f"余额：{self._format_usd(summary.balance)}\n"
             f"已使用（近30天）：{self._format_usd(summary.used_last_30_days)}\n"
             f"并发上限：{summary.concurrency}"
@@ -1754,19 +1734,16 @@ class FapiPlugin(Star):
 
     async def _resolve_private_admin_user(
         self,
-        username: str,
+        email: str,
     ) -> tuple[TokenRouterUser | None, str | None]:
-        exact_username = username.strip()
-        if not exact_username:
-            return None, "请输入用户名，用户名必须完全一致。"
-        if len(exact_username) > 128 or any(
-            ord(character) < 32 or 127 <= ord(character) <= 159
-            for character in exact_username
-        ):
-            return None, "用户名格式不正确。"
+        exact_email = email.strip()
+        if not exact_email:
+            return None, "请输入邮箱，邮箱必须完全一致。"
+        if len(exact_email) > 254 or not self._looks_like_email(exact_email):
+            return None, "邮箱格式不正确。"
 
         try:
-            users = await self.client.find_users_by_exact_username(exact_username)
+            users = await self.client.find_users_by_exact_email(exact_email)
         except TokenRouterError as exc:
             logger.warning(
                 "FAPI 管理员精确查询用户失败：status=%s, code=%s, error=%s",
@@ -1780,9 +1757,9 @@ class FapiPlugin(Star):
             return None, "管理员查询服务暂时不可用，请稍后重试。"
 
         if not users:
-            return None, f"未找到用户名完全匹配“{exact_username}”的中转站用户。"
+            return None, "未找到邮箱完全匹配的中转站用户。"
         if len(users) > 1:
-            return None, "存在多个同名用户，为避免误操作，本次管理操作已取消。"
+            return None, "存在多个相同邮箱用户，为避免误操作，本次管理操作已取消。"
         return users[0], None
 
     @staticmethod
@@ -1851,8 +1828,9 @@ class FapiPlugin(Star):
     ) -> str:
         lines = [
             "用户 RPM 状态（当前分钟）",
-            f"用户：{FapiPlugin._safe_reply_field(user.username, maximum=64)}"
+            f"邮箱：{FapiPlugin._safe_reply_field(user.email, maximum=254)}"
             f"（ID {user.user_id}）",
+            f"用户名：{FapiPlugin._safe_reply_field(user.username, maximum=64)}",
             f"总 RPM：{FapiPlugin._rpm_usage_text(status.used, status.limit)}",
         ]
         if not status.per_group:
@@ -2131,7 +2109,12 @@ class FapiPlugin(Star):
 
     @staticmethod
     def _looks_like_email(value: str) -> bool:
-        if any(character.isspace() for character in value):
+        if not 3 <= len(value) <= 254 or any(
+            character.isspace()
+            or ord(character) < 32
+            or 127 <= ord(character) <= 159
+            for character in value
+        ):
             return False
         local_part, separator, domain = value.rpartition("@")
         return bool(
@@ -2139,7 +2122,16 @@ class FapiPlugin(Star):
             and local_part
             and "." in domain
             and not domain.startswith(".")
+            and not domain.endswith(".")
         )
+
+    @staticmethod
+    def _mask_email(value: str) -> str:
+        local_part, separator, domain = value.rpartition("@")
+        if not separator or not local_part or not domain:
+            return "***"
+        visible = local_part[:2] if len(local_part) > 1 else local_part[:1]
+        return FapiPlugin._safe_reply_field(f"{visible}...@{domain}", maximum=254)
 
     @staticmethod
     def _format_usd(value) -> str:

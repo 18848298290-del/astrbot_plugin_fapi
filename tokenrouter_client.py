@@ -149,6 +149,38 @@ def resolve_exact_username_users(
     return list(matches.values())
 
 
+def resolve_exact_email_users(
+    data: Any,
+    expected_email: str,
+) -> list[TokenRouterUser]:
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        raise TokenRouterError("用户列表响应格式不正确")
+
+    expected = expected_email.strip()
+    matches: dict[int, TokenRouterUser] = {}
+    for item in data["items"]:
+        if not isinstance(item, dict):
+            continue
+        username = item.get("username")
+        email = item.get("email")
+        user_id = _positive_int(item.get("id"))
+        if (
+            not isinstance(username, str)
+            or not isinstance(email, str)
+            or user_id is None
+        ):
+            continue
+        if email != expected:
+            continue
+        matches[user_id] = TokenRouterUser(
+            user_id=user_id,
+            username=username,
+            email=email,
+            status=str(item.get("status") or ""),
+        )
+    return list(matches.values())
+
+
 def resolve_balance_summary(
     user_data: Any,
     usage_data: Any,
@@ -516,6 +548,37 @@ class TokenRouterClient:
         return resolve_exact_username_users(
             {"items": all_items},
             normalized_username,
+        )
+
+    async def find_users_by_exact_email(
+        self,
+        email: str,
+    ) -> list[TokenRouterUser]:
+        normalized_email = email.strip()
+        all_items: list[Any] = []
+        page = 1
+        while True:
+            data = await self._get(
+                "/api/v1/admin/users",
+                params={
+                    "page": page,
+                    "page_size": 1000,
+                    "search": normalized_email,
+                    "include_subscriptions": "false",
+                },
+            )
+            if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                raise TokenRouterError("用户列表响应格式不正确")
+            all_items.extend(data["items"])
+
+            pages = _positive_int(data.get("pages")) or 1
+            if page >= pages:
+                break
+            page += 1
+
+        return resolve_exact_email_users(
+            {"items": all_items},
+            normalized_email,
         )
 
     async def get_balance_summary(self, user_id: int) -> TokenRouterBalanceSummary:

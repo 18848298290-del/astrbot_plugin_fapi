@@ -372,9 +372,9 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(replies), 1)
         self.assertIn("FAPI 管理员私聊菜单", replies[0])
         self.assertIn("/fapi 管理 概览", replies[0])
-        self.assertIn("/fapi 管理 RPM [用户名]", replies[0])
+        self.assertIn("/fapi 管理 RPM [邮箱]", replies[0])
         self.assertIn("/fapi 管理 排行 [数量]", replies[0])
-        self.assertIn("/fapi 管理 查询 <用户名>", replies[0])
+        self.assertIn("/fapi 管理 查询 <邮箱>", replies[0])
         self.assertIn("USD 1,000.00", replies[0])
 
     async def test_private_admin_rejects_regular_user_before_external_access(self):
@@ -437,8 +437,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_private_admin_queries_exact_user(self):
         class Client:
-            async def find_users_by_exact_username(_self, username):
-                self.assertEqual(username, "alice")
+            async def find_users_by_exact_email(_self, email):
+                self.assertEqual(email, "alice@example.com")
                 return [user(7, "alice", "alice@example.com")]
 
             async def get_balance_summary(_self, user_id):
@@ -453,7 +453,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         replies = await collect(
             self.plugin.admin_private(
                 FakeEvent(group_id=None, astrbot_admin=True),
-                "查询 alice",
+                "查询 alice@example.com",
             )
         )
 
@@ -464,10 +464,10 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已使用（近30天）：USD 3.25", replies[0])
         self.assertIn("并发上限：8", replies[0])
 
-    async def test_private_admin_keeps_spaces_in_query_username(self):
+    async def test_private_admin_trims_query_email(self):
         class Client:
-            async def find_users_by_exact_username(_self, username):
-                self.assertEqual(username, "Alice Smith")
+            async def find_users_by_exact_email(_self, email):
+                self.assertEqual(email, "alice@example.com")
                 return [user(7, "Alice Smith", "alice@example.com")]
 
             async def get_balance_summary(_self, user_id):
@@ -482,7 +482,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         replies = await collect(
             self.plugin.admin_private(
                 FakeEvent(group_id=None, astrbot_admin=True),
-                "查询 Alice Smith",
+                "查询   alice@example.com   ",
             )
         )
 
@@ -528,8 +528,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_private_admin_queries_user_rpm_and_limits_group_output(self):
         class Client:
-            async def find_users_by_exact_username(_self, username):
-                self.assertEqual(username, "alice")
+            async def find_users_by_exact_email(_self, email):
+                self.assertEqual(email, "alice@example.com")
                 return [user(7, "alice", "alice@example.com")]
 
             async def get_user_rpm_status(_self, user_id):
@@ -550,11 +550,13 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         replies = await collect(
             self.plugin.admin_private(
                 FakeEvent(group_id=None, astrbot_admin=True),
-                "RPM alice",
+                "RPM alice@example.com",
             )
         )
 
         self.assertIn("用户 RPM 状态（当前分钟）", replies[0])
+        self.assertIn("邮箱：alice@example.com（ID 7）", replies[0])
+        self.assertIn("用户名：alice", replies[0])
         self.assertIn("总 RPM：4 / 不限", replies[0])
         self.assertIn("group-1：1 / 不限 (用户覆盖)", replies[0])
         self.assertIn("另有 2 个分组未显示", replies[0])
@@ -679,12 +681,12 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(replies, ["排行数量必须是 1 到 20 的整数。"])
 
-    async def test_private_admin_refuses_duplicate_exact_username(self):
+    async def test_private_admin_refuses_duplicate_exact_email(self):
         class Client:
-            async def find_users_by_exact_username(_self, _username):
+            async def find_users_by_exact_email(_self, _email):
                 return [
-                    user(7, "alice", "first@example.com"),
-                    user(8, "alice", "second@example.com"),
+                    user(7, "alice", "same@example.com"),
+                    user(8, "alice", "same@example.com"),
                 ]
 
             async def adjust_balance(_self, **_values):
@@ -694,13 +696,13 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         replies = await collect(
             self.plugin.admin_private(
                 FakeEvent(group_id=None, astrbot_admin=True),
-                "加余额 alice 1.25",
+                "加余额 same@example.com 1.25",
             )
         )
 
         self.assertEqual(
             replies,
-            ["存在多个同名用户，为避免误操作，本次管理操作已取消。"],
+            ["存在多个相同邮箱用户，为避免误操作，本次管理操作已取消。"],
         )
 
     async def test_private_admin_adds_balance_with_stable_idempotency_key(self):
@@ -708,7 +710,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             def __init__(_self):
                 _self.adjustments = []
 
-            async def find_users_by_exact_username(_self, _username):
+            async def find_users_by_exact_email(_self, email):
+                self.assertEqual(email, "alice@example.com")
                 return [user(7, "alice", "alice@example.com")]
 
             async def adjust_balance(_self, **values):
@@ -724,10 +727,10 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         )
 
         first = await collect(
-            self.plugin.admin_private(event, "加余额 alice 1.25")
+            self.plugin.admin_private(event, "加余额 alice@example.com 1.25")
         )
         second = await collect(
-            self.plugin.admin_private(event, "加余额 alice 1.25")
+            self.plugin.admin_private(event, "加余额 alice@example.com 1.25")
         )
 
         self.assertIn("余额调整成功", first[0])
@@ -747,13 +750,13 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_private_admin_adjusts_spaced_username(self):
+    async def test_private_admin_adjusts_balance_by_email(self):
         class Client:
             def __init__(_self):
                 _self.adjustments = []
 
-            async def find_users_by_exact_username(_self, username):
-                self.assertEqual(username, "Alice Smith")
+            async def find_users_by_exact_email(_self, email):
+                self.assertEqual(email, "alice@example.com")
                 return [user(7, "Alice Smith", "alice@example.com")]
 
             async def adjust_balance(_self, **values):
@@ -767,9 +770,9 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
                 FakeEvent(
                     group_id=None,
                     astrbot_admin=True,
-                    message_id="admin-spaced-username",
+                    message_id="admin-email",
                 ),
-                "加余额 Alice Smith 1.25",
+                "加余额 alice@example.com 1.25",
             )
         )
 
@@ -788,7 +791,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent(group_id=None, astrbot_admin=True)
 
         adjustment = await collect(
-            self.plugin.admin_private(event, "加余额 alice 1.25 trailing")
+            self.plugin.admin_private(event, "加余额 alice@example.com 1.25 trailing")
         )
         overview = await collect(
             self.plugin.admin_private(event, "概览 trailing")
@@ -811,14 +814,14 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_private_admin_validates_write_before_user_lookup(self):
         class ForbiddenClient:
-            async def find_users_by_exact_username(_self, _username):
+            async def find_users_by_exact_email(_self, _email):
                 raise AssertionError("非法金额不应查询用户")
 
         self.plugin.client = ForbiddenClient()
         event = FakeEvent(group_id=None, astrbot_admin=True)
 
         too_large = await collect(
-            self.plugin.admin_private(event, "加余额 alice 1000.00000001")
+            self.plugin.admin_private(event, "加余额 alice@example.com 1000.00000001")
         )
         missing_message_id = await collect(
             self.plugin.admin_private(
@@ -828,7 +831,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
                     message_id=None,
                     raw_message={},
                 ),
-                "减余额 alice 1.00",
+                "减余额 alice@example.com 1.00",
             )
         )
 
@@ -840,7 +843,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             def __init__(_self):
                 _self.unknown = False
 
-            async def find_users_by_exact_username(_self, _username):
+            async def find_users_by_exact_email(_self, _email):
                 return [user(7, "alice", "alice@example.com")]
 
             async def adjust_balance(_self, **_values):
@@ -860,21 +863,15 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent(group_id=None, astrbot_admin=True)
 
         insufficient = await collect(
-            self.plugin.admin_private(event, "减余额 alice 1.00")
+            self.plugin.admin_private(event, "减余额 alice@example.com 1.00")
         )
         client.unknown = True
         unknown = await collect(
-            self.plugin.admin_private(event, "加余额 alice 1.00")
+            self.plugin.admin_private(event, "加余额 alice@example.com 1.00")
         )
 
         self.assertEqual(insufficient, ["用户余额不足，本次未扣减。"])
         self.assertIn("不要重复发送调账命令", unknown[0])
-
-    async def test_requires_username(self):
-        replies = await collect(self.plugin.bind(FakeEvent()))
-
-        self.assertEqual(len(replies), 1)
-        self.assertIn("/fapi 绑定 <用户名>", replies[0])
 
     async def test_constructor_rejects_duplicate_table_names_case_insensitively(self):
         with self.assertRaisesRegex(ValueError, "MySQL 数据表名称必须互不相同"):
@@ -986,7 +983,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(replies), 1)
         self.assertIn("FAPI 功能菜单", replies[0])
-        self.assertIn("/fapi 绑定 <用户名>", replies[0])
+        self.assertIn("/fapi 绑定\n", replies[0])
+        self.assertIn("/fapi 绑定 <完整邮箱>", replies[0])
         self.assertIn("/fapi 余额", replies[0])
         self.assertIn("/fapi 签到", replies[0])
         self.assertIn("/fapi 抢红包 [红包编号]", replies[0])
@@ -1007,8 +1005,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(len(replies), 1)
-        self.assertIn("/fapi 绑定 <用户名> <完整邮箱>", replies[0])
-        self.assertNotIn("/fapi 绑定 <用户名>\n", replies[0])
+        self.assertIn("/fapi 绑定 <完整邮箱>", replies[0])
+        self.assertNotIn("/fapi 绑定\n", replies[0])
         self.assertIn("红包创建：仅 AstrBot 管理员", replies[0])
 
     async def test_help_menu_is_rejected_outside_configured_group(self):
@@ -1023,7 +1021,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejects_private_binding_before_api_or_database_access(self):
         class Client:
-            async def find_users_by_exact_username(_self, _username):
+            async def find_users_by_exact_email(_self, _email):
                 raise AssertionError("私聊绑定不应查询中转站")
 
         class Store:
@@ -1034,7 +1032,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.plugin.bindings = Store()
 
         replies = await collect(
-            self.plugin.bind(FakeEvent(group_id=None), "alice")
+            self.plugin.bind(FakeEvent(group_id=None), "alice@example.com")
         )
 
         self.assertEqual(replies, ["该指令只能在管理员配置的指定群中使用。"])
@@ -1055,7 +1053,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent(role="admin", astrbot_admin=True)
         commands = (
             self.plugin.help_menu(event),
-            self.plugin.bind(event, "alice", "alice@example.com"),
+            self.plugin.bind(event, "alice@example.com"),
             self.plugin.binding_status(event),
             self.plugin.balance(event),
             self.plugin.checkin(event),
@@ -1091,7 +1089,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         )
         commands = (
             self.plugin.help_menu(event),
-            self.plugin.bind(event, "alice", "alice@example.com"),
+            self.plugin.bind(event, "alice@example.com"),
             self.plugin.binding_status(event),
             self.plugin.balance(event),
             self.plugin.checkin(event),
@@ -1110,7 +1108,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_official_bot_requires_full_email_before_user_lookup(self):
         class Client:
-            async def find_users_by_exact_username(_self, _username):
+            async def find_users_by_exact_email(_self, _email):
                 raise AssertionError("缺少邮箱时不应查询中转站")
 
         self.plugin._allowed_group_id = "official-group-openid"
@@ -1122,7 +1120,6 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
                     platform_name="qq_official",
                     group_id="official-group-openid",
                 ),
-                "alice",
             )
         )
 
@@ -1130,7 +1127,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             replies,
             [
                 "QQ 官方机器人无法取得真实 QQ 号，请使用："
-                "/fapi 绑定 <用户名> <完整邮箱>"
+                "/fapi 绑定 <完整邮箱>"
             ],
         )
 
@@ -1138,8 +1135,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         class Client:
-            async def find_users_by_exact_username(_self, username):
-                calls.append(("lookup", username))
+            async def find_users_by_exact_email(_self, email):
+                calls.append(("lookup", email))
                 return [user(7, "alice", "alice@example.com")]
 
         class Store:
@@ -1157,13 +1154,12 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
                     platform_name="qq_official",
                     group_id="official-group-openid",
                 ),
-                "alice",
                 "alice@example.com",
             )
         )
 
         self.assertEqual(replies, ["绑定成功。"])
-        self.assertEqual(calls[0], ("lookup", "alice"))
+        self.assertEqual(calls[0], ("lookup", "alice@example.com"))
         self.assertEqual(
             calls[1],
             (
@@ -1178,7 +1174,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_official_bot_explains_legacy_binding_conflict(self):
         class Client:
-            async def find_users_by_exact_username(_self, _username):
+            async def find_users_by_exact_email(_self, _email):
                 return [user(7, "alice", "alice@example.com")]
 
         class Store:
@@ -1195,7 +1191,6 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
                     platform_name="qq_official",
                     group_id="official-group-openid",
                 ),
-                "alice",
                 "alice@example.com",
             )
         )
@@ -1892,12 +1887,12 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][0], "claim_pending")
         self.assertEqual(calls[1], ("settle", True))
 
-    async def test_binds_exact_username_with_sender_qq_email(self):
+    async def test_binds_sender_qq_email_without_argument(self):
         calls = []
 
         class Client:
-            async def find_users_by_exact_username(_self, username):
-                calls.append(("lookup", username))
+            async def find_users_by_exact_email(_self, email):
+                calls.append(("lookup", email))
                 return [user(7, "alice", "12345@qq.com")]
 
         class Store:
@@ -1908,10 +1903,10 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.plugin.client = Client()
         self.plugin.bindings = Store()
 
-        replies = await collect(self.plugin.bind(FakeEvent(), "alice"))
+        replies = await collect(self.plugin.bind(FakeEvent()))
 
         self.assertEqual(replies, ["绑定成功。"])
-        self.assertEqual(calls[0], ("lookup", "alice"))
+        self.assertEqual(calls[0], ("lookup", "12345@qq.com"))
         self.assertEqual(
             calls[1],
             (
@@ -1924,13 +1919,11 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-    async def test_selects_qq_email_user_when_exact_username_is_duplicated(self):
+    async def test_duplicate_usernames_do_not_affect_email_binding(self):
         class Client:
-            async def find_users_by_exact_username(_self, _username):
-                return [
-                    user(6, "alice", "alice@example.com"),
-                    user(7, "alice", "12345@qq.com"),
-                ]
+            async def find_users_by_exact_email(_self, email):
+                self.assertEqual(email, "12345@qq.com")
+                return [user(7, "alice", "12345@qq.com")]
 
         class Store:
             async def bind(_self, **values):
@@ -1940,14 +1933,15 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.plugin.client = Client()
         self.plugin.bindings = Store()
 
-        replies = await collect(self.plugin.bind(FakeEvent(), "alice"))
+        replies = await collect(self.plugin.bind(FakeEvent()))
 
         self.assertEqual(replies, ["绑定成功。"])
 
-    async def test_prompts_for_email_when_username_has_no_qq_email(self):
+    async def test_reports_missing_automatic_qq_email(self):
         class Client:
-            async def find_users_by_exact_username(_self, _username):
-                return [user(7, "alice", "alice@example.com")]
+            async def find_users_by_exact_email(_self, email):
+                self.assertEqual(email, "12345@qq.com")
+                return []
 
         class Store:
             async def bind(_self, **_values):
@@ -1956,17 +1950,16 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.plugin.client = Client()
         self.plugin.bindings = Store()
 
-        replies = await collect(self.plugin.bind(FakeEvent(), "alice"))
+        replies = await collect(self.plugin.bind(FakeEvent()))
 
-        self.assertEqual(len(replies), 1)
-        self.assertIn("/fapi 绑定 alice <完整邮箱>", replies[0])
+        self.assertEqual(replies, ["未找到邮箱完全匹配的中转站用户，绑定已暂停。"])
 
-    async def test_binds_exact_username_and_non_qq_email(self):
+    async def test_binds_exact_non_qq_email(self):
         calls = []
 
         class Client:
-            async def find_users_by_exact_username(_self, username):
-                calls.append(("lookup", username))
+            async def find_users_by_exact_email(_self, email):
+                calls.append(("lookup", email))
                 return [user(7, "alice", "alice@example.com")]
 
         class Store:
@@ -1978,37 +1971,37 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.plugin.bindings = Store()
 
         replies = await collect(
-            self.plugin.bind(FakeEvent(), "alice", "alice@example.com")
+            self.plugin.bind(FakeEvent(), "alice@example.com")
         )
 
         self.assertEqual(replies, ["绑定成功。"])
-        self.assertEqual(calls[0], ("lookup", "alice"))
+        self.assertEqual(calls[0], ("lookup", "alice@example.com"))
         self.assertEqual(calls[1][1]["tokenrouter_user_id"], 7)
         self.assertEqual(calls[1][1]["email"], "alice@example.com")
 
-    async def test_rejects_email_that_does_not_match_exact_username(self):
+    async def test_rejects_legacy_username_and_email_syntax(self):
         class Client:
-            async def find_users_by_exact_username(_self, _username):
-                return [user(7, "alice", "alice@example.com")]
+            async def find_users_by_exact_email(_self, _email):
+                raise AssertionError("旧语法不应查询用户")
 
         class Store:
             async def bind(_self, **_values):
-                raise AssertionError("用户名和邮箱错配时不应写入数据库")
+                raise AssertionError("旧语法不应写入数据库")
 
         self.plugin.client = Client()
         self.plugin.bindings = Store()
 
         replies = await collect(
-            self.plugin.bind(FakeEvent(), "alice", "other@example.com")
+            self.plugin.bind(FakeEvent(), "alice", "alice@example.com")
         )
 
-        self.assertEqual(len(replies), 1)
-        self.assertIn("未同时完全匹配", replies[0])
+        self.assertEqual(replies, ["绑定不再使用用户名，请使用：/fapi 绑定 <完整邮箱>"])
 
     async def test_email_match_is_case_sensitive(self):
         class Client:
-            async def find_users_by_exact_username(_self, _username):
-                return [user(7, "alice", "Alice@Example.com")]
+            async def find_users_by_exact_email(_self, email):
+                self.assertEqual(email, "alice@example.com")
+                return []
 
         class Store:
             async def bind(_self, **_values):
@@ -2017,36 +2010,32 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.plugin.client = Client()
         self.plugin.bindings = Store()
 
-        replies = await collect(
-            self.plugin.bind(FakeEvent(), "alice", "alice@example.com")
-        )
+        replies = await collect(self.plugin.bind(FakeEvent(), "alice@example.com"))
 
-        self.assertIn("未同时完全匹配", replies[0])
+        self.assertIn("未找到邮箱完全匹配", replies[0])
 
-    async def test_rejects_email_belonging_to_different_user(self):
+    async def test_rejects_invalid_email_before_user_lookup(self):
         class Client:
-            async def find_users_by_exact_username(_self, _username):
-                return [user(7, "alice", "alice@example.com")]
+            async def find_users_by_exact_email(_self, _email):
+                raise AssertionError("非法邮箱不应查询用户")
 
         class Store:
             async def bind(_self, **_values):
-                raise AssertionError("不得跨用户组合用户名和邮箱")
+                raise AssertionError("非法邮箱不应写入数据库")
 
         self.plugin.client = Client()
         self.plugin.bindings = Store()
 
-        replies = await collect(
-            self.plugin.bind(FakeEvent(), "alice", "bob@example.com")
-        )
+        replies = await collect(self.plugin.bind(FakeEvent(), "not-an-email"))
 
-        self.assertIn("同一个中转站用户", replies[0])
+        self.assertIn("邮箱格式不完整", replies[0])
 
-    async def test_rejects_ambiguous_same_username_and_email(self):
+    async def test_rejects_ambiguous_same_email(self):
         class Client:
-            async def find_users_by_exact_username(_self, _username):
+            async def find_users_by_exact_email(_self, _email):
                 return [
                     user(7, "alice", "alice@example.com"),
-                    user(8, "alice", "alice@example.com"),
+                    user(8, "duplicate-name", "alice@example.com"),
                 ]
 
         class Store:
@@ -2057,7 +2046,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.plugin.bindings = Store()
 
         replies = await collect(
-            self.plugin.bind(FakeEvent(), "alice", "alice@example.com")
+            self.plugin.bind(FakeEvent(), "alice@example.com")
         )
 
         self.assertIn("存在多个", replies[0])
@@ -2078,7 +2067,10 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         class Store:
             async def get_by_qq(_self, qq_id):
                 calls.append(("binding", qq_id))
-                return SimpleNamespace(tokenrouter_user_id=73)
+                return SimpleNamespace(
+                    tokenrouter_user_id=73,
+                    email="ryan@example.com",
+                )
 
         self.plugin.client = Client()
         self.plugin.bindings = Store()
@@ -2091,7 +2083,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             replies,
             [
-                "用户名：RYAN\n"
+                "邮箱：ry...@example.com\n"
                 "余额：USD 10.00\n"
                 "已使用（近30天）：USD 1.25\n"
                 "并发上限：5"
@@ -2135,7 +2127,10 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         class Store:
             async def get_by_qq(_self, qq_id):
                 calls.append(("binding", qq_id))
-                return SimpleNamespace(tokenrouter_user_id=73)
+                return SimpleNamespace(
+                    tokenrouter_user_id=73,
+                    email="r@example.com",
+                )
 
         self.plugin.client = Client()
         self.plugin.bindings = Store()
@@ -2146,7 +2141,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             replies,
             [
-                "用户名：RYAN\n"
+                "邮箱：r...@example.com\n"
                 "余额：USD 10.00\n"
                 "已使用（近30天）：USD 1.2345\n"
                 "并发上限：5"
