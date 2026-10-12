@@ -2437,6 +2437,181 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replies, ["红包编号不正确。"])
 
 
+    async def test_unbind_requires_confirmation_and_sets_persistent_cooldown(self):
+        calls = []
+
+        class Store:
+            async def get_by_qq(_self, qq_id):
+                self.assertEqual(qq_id, "12345")
+                return SimpleNamespace(tokenrouter_user_id=73)
+
+            async def unbind(_self, **values):
+                calls.append(values)
+                return True
+
+        self.plugin.bindings = Store()
+        first = await collect(self.plugin.unbind(FakeEvent()))
+        second = await collect(self.plugin.unbind(FakeEvent(), "确认"))
+
+        self.assertIn("60 秒内", first[0])
+        self.assertEqual(second, ["解绑成功。重新绑定冷却：1 小时。"])
+        self.assertEqual(calls[0]["expected_user_id"], 73)
+        self.assertEqual(calls[0]["cooldown_seconds"], 3600)
+
+    async def test_unbind_confirmation_expires_closed(self):
+        class Store:
+            async def unbind(_self, **_values):
+                raise AssertionError("没有预确认时不得删除绑定")
+
+        self.plugin.bindings = Store()
+        replies = await collect(self.plugin.unbind(FakeEvent(), "确认"))
+
+        self.assertIn("确认已过期", replies[0])
+
+    async def test_bind_reports_persistent_cooldown(self):
+        class Client:
+            async def find_users_by_exact_email(_self, _email):
+                return [user(7, "alice", "alice@example.com")]
+
+        class Store:
+            async def bind(_self, **_values):
+                raise self.module.BindCooldownActive(90)
+
+        self.plugin.client = Client()
+        self.plugin.bindings = Store()
+        replies = await collect(self.plugin.bind(FakeEvent(), "alice@example.com"))
+
+        self.assertEqual(replies, ["解绑冷却中，请在 1 分钟 30 秒 后再绑定。"])
+
+    async def test_reward_ranking_masks_email_and_uses_settled_rows(self):
+        class Rewards:
+            async def get_ranking(_self, **values):
+                self.assertEqual(values, {"source_type": "checkin", "limit": 10})
+                return [
+                    SimpleNamespace(
+                        tokenrouter_user_id=7,
+                        count=12,
+                        amount_units=150_000_000,
+                    )
+                ]
+
+        class Bindings:
+            async def get_by_user_ids(_self, user_ids):
+                self.assertEqual(user_ids, {7})
+                return {7: SimpleNamespace(email="alice@example.com")}
+
+        self.plugin.rewards = Rewards()
+        self.plugin.bindings = Bindings()
+        replies = await collect(self.plugin.checkin_ranking(FakeEvent()))
+
+        self.assertIn("al...@example.com", replies[0])
+        self.assertNotIn("alice@example.com", replies[0])
+        self.assertIn("12 天", replies[0])
+
+    async def test_user_ledger_marks_pending_reward_without_claiming_arrival(self):
+        created_at = self.module.datetime(2026, 10, 12, 1, 2, 3)
+
+        class Bindings:
+            async def get_by_qq(_self, _qq_id):
+                return SimpleNamespace(
+                    tokenrouter_user_id=7,
+                    email="alice@example.com",
+                )
+
+        class Rewards:
+            async def get_user_ledger(_self, _user_id, **_values):
+                return [
+                    SimpleNamespace(
+                        operation_id="reward-1",
+                        source_type="checkin",
+                        amount_units=5_000_000,
+                        status=self.module.RewardJobStatus.PENDING,
+                        created_at=created_at,
+                    )
+                ]
+
+        class Games:
+            async def get_user_operations(_self, _user_id, **_values):
+                return []
+
+        self.plugin.bindings = Bindings()
+        self.plugin.rewards = Rewards()
+        self.plugin.games = Games()
+        replies = await collect(self.plugin.ledger(FakeEvent()))
+
+        self.assertIn("签到 +USD 0.05（待补发）", replies[0])
+        self.assertIn("al...@example.com", replies[0])
+
+    async def test_admin_can_list_and_retry_existing_reward_task(self):
+        job = self.module.RewardJob(
+            operation_id="reward-task-1",
+            source_type="checkin",
+            qq_id="12345",
+            tokenrouter_user_id=7,
+            amount_units=5_000_000,
+            redeem_code="FAPIR_TEST",
+            status=self.module.RewardJobStatus.PENDING,
+            attempt_count=2,
+            created_at=self.module.datetime(2026, 10, 12, 1, 0, 0),
+        )
+        retried = []
+
+        class Rewards:
+            async def list_incomplete_jobs(_self, **_values):
+                return [job]
+
+            async def get_reward_job(_self, operation_id):
+                return job if operation_id == job.operation_id else None
+
+            async def retry_reward_job(_self, operation_id):
+                retried.append(operation_id)
+                return True
+
+        class Games:
+            async def list_incomplete(_self, **_values):
+                return []
+
+            async def get(_self, _operation_id):
+                raise AssertionError("奖励任务不应查询游戏表")
+
+        self.plugin.rewards = Rewards()
+        self.plugin.games = Games()
+        event = FakeEvent(group_id=None, astrbot_admin=True)
+        listed = await collect(self.plugin.admin_private(event, "未完成任务"))
+        retried_reply = await collect(
+            self.plugin.admin_private(event, "重试 reward-task-1")
+        )
+
+        self.assertIn("reward-task-1", listed[0])
+        self.assertIn("固定兑换码不变", retried_reply[0])
+        self.assertEqual(retried, ["reward-task-1"])
+
+    async def test_daily_broadcast_reply_contains_site_and_reward_stats(self):
+        overview = SimpleNamespace(
+            today_requests=12,
+            today_tokens=345,
+            today_actual_cost=Decimal("1.25"),
+            rpm=2,
+            tpm=30,
+            stats_stale=False,
+        )
+        stats = self.module.DailyRewardStats(
+            reward_date=self.module.date(2026, 10, 12),
+            checkin_count=3,
+            checkin_units=15_000_000,
+            red_packet_count=1,
+            red_packet_units=100_000_000,
+            claim_count=2,
+            claim_units=50_000_000,
+        )
+
+        reply = self.plugin._daily_broadcast_reply(overview, stats)
+
+        self.assertIn("FAPI 每日播报 2026-10-12", reply)
+        self.assertIn("签到：3 人", reply)
+        self.assertIn("红包到账：2 份", reply)
+
+
 async def _async_value(value):
     return value
 

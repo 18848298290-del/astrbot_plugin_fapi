@@ -3,7 +3,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import binding_store
-from binding_store import BindStatus, MySQLBindingStore, classify_existing_bindings
+from binding_store import (
+    BindCooldownActive,
+    BindStatus,
+    MySQLBindingStore,
+    classify_existing_bindings,
+)
 
 
 class ClassifyExistingBindingsTest(unittest.TestCase):
@@ -129,6 +134,121 @@ class PlatformIdMigrationTest(unittest.IsolatedAsyncioTestCase):
         await self.store()._ensure_platform_id_column(cursor)
 
         self.assertFalse(any("ALTER TABLE" in sql for sql, _ in cursor.executions))
+
+
+class BindingCooldownTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def store(cursor):
+        class Connection:
+            def __init__(self):
+                self.commits = 0
+                self.rollbacks = 0
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def cursor(self):
+                return cursor
+
+            async def begin(self):
+                pass
+
+            async def commit(self):
+                self.commits += 1
+
+            async def rollback(self):
+                self.rollbacks += 1
+
+        class Pool:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def acquire(self):
+                return self.connection
+
+        store = MySQLBindingStore(
+            host="db.example.com",
+            port=3306,
+            user="fapi",
+            password="secret",
+            database="astrbot",
+        )
+        connection = Connection()
+        store._pool = Pool(connection)
+        return store, connection
+
+    async def test_bind_rejects_active_cooldown_before_insert(self):
+        class Cursor:
+            def __init__(self):
+                self.executions = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def execute(self, sql, params=None):
+                self.executions.append((sql, params))
+
+            async def fetchall(self):
+                return []
+
+            async def fetchone(self):
+                return {"retry_after": 1}
+
+        cursor = Cursor()
+        store, connection = self.store(cursor)
+
+        with self.assertRaises(BindCooldownActive) as raised:
+            await store.bind(
+                qq_id="member-openid",
+                tokenrouter_user_id=7,
+                email="alice@example.com",
+            )
+
+        self.assertEqual(raised.exception.retry_after_seconds, 1)
+        self.assertEqual(connection.rollbacks, 1)
+        cooldown_sql = cursor.executions[1][0]
+        self.assertIn("TIMESTAMPDIFF(MICROSECOND", cooldown_sql)
+        self.assertFalse(any("INSERT INTO `astrbot_fapi_bindings`" in sql for sql, _ in cursor.executions))
+
+    async def test_unbind_deletes_expected_binding_and_persists_cooldown(self):
+        class Cursor:
+            rowcount = 1
+
+            def __init__(self):
+                self.executions = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def execute(self, sql, params=None):
+                self.executions.append((sql, params))
+
+            async def fetchone(self):
+                return {"tokenrouter_user_id": 7}
+
+        cursor = Cursor()
+        store, connection = self.store(cursor)
+
+        removed = await store.unbind(
+            qq_id="member-openid",
+            expected_user_id=7,
+            cooldown_seconds=3600,
+        )
+
+        self.assertTrue(removed)
+        self.assertEqual(connection.commits, 1)
+        self.assertIn("DELETE FROM", cursor.executions[1][0])
+        self.assertIn(store.cooldown_table, cursor.executions[2][0])
+        self.assertEqual(cursor.executions[2][1], ("member-openid", 3600))
 
 
 if __name__ == "__main__":

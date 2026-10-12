@@ -30,6 +30,13 @@
     "hint": "管理员私聊命令单次增加或扣减余额的最大金额，最多支持 8 位小数。",
     "default": "1000.00"
   },
+  "unbind_cooldown_seconds": {
+    "description": "解绑后重新绑定冷却秒数",
+    "type": "int",
+    "hint": "用户二次确认解绑后，在此时间内不能重新绑定。默认 3600 秒，设为 0 可关闭冷却。",
+    "default": 3600,
+    "slider": {"min": 0, "max": 2592000, "step": 60}
+  },
   "request_timeout": {
     "description": "中转站请求超时秒数",
     "type": "int",
@@ -73,6 +80,12 @@
     "type": "string",
     "hint": "插件启动时会自动创建该表；仅支持字母、数字和下划线。",
     "default": "astrbot_fapi_bindings"
+  },
+  "mysql_binding_cooldowns_table": {
+    "description": "解绑冷却数据表名",
+    "type": "string",
+    "hint": "插件启动时自动创建，用于跨重启保存重新绑定冷却。",
+    "default": "astrbot_fapi_binding_cooldowns"
   },
   "mysql_connect_timeout": {
     "description": "MySQL 连接超时秒数",
@@ -179,6 +192,24 @@
     "type": "string",
     "hint": "用于签到日期和每日预算统计，例如 Asia/Shanghai。",
     "default": "Asia/Shanghai"
+  },
+  "daily_broadcast_enabled": {
+    "description": "启用每日群播报",
+    "type": "bool",
+    "hint": "每天向指定 UMO 推送全站概览、签到和红包统计。",
+    "default": false
+  },
+  "daily_broadcast_umo": {
+    "description": "每日播报群 UMO",
+    "type": "string",
+    "hint": "填写 /sid 显示的完整 UMO，最后一段必须与指定 QQ 群 ID 一致。",
+    "default": ""
+  },
+  "daily_broadcast_time": {
+    "description": "每日播报时间",
+    "type": "string",
+    "hint": "使用 reward_timezone 时区的 HH:MM 格式，例如 23:55。",
+    "default": "23:55"
   },
   "mysql_reward_jobs_table": {
     "description": "奖励任务表名",

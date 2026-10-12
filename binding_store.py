@@ -21,6 +21,12 @@ class BindingDatabaseError(RuntimeError):
     pass
 
 
+class BindCooldownActive(BindingDatabaseError):
+    def __init__(self, retry_after_seconds: int) -> None:
+        self.retry_after_seconds = max(1, int(retry_after_seconds))
+        super().__init__(f"binding cooldown active for {self.retry_after_seconds} seconds")
+
+
 class BindStatus(str, Enum):
     CREATED = "created"
     EXISTING = "existing"
@@ -70,6 +76,7 @@ class MySQLBindingStore:
         password: str,
         database: str,
         table: str = "astrbot_fapi_bindings",
+        cooldown_table: str = "astrbot_fapi_binding_cooldowns",
         connect_timeout: int = 10,
         ssl_enabled: bool = True,
         ssl_verify: bool = True,
@@ -80,6 +87,7 @@ class MySQLBindingStore:
         self.password = password
         self.database = database.strip()
         self.table = table.strip()
+        self.cooldown_table = cooldown_table.strip()
         self.connect_timeout = max(1, connect_timeout)
         self.ssl_enabled = ssl_enabled
         self.ssl_verify = ssl_verify
@@ -142,6 +150,8 @@ class MySQLBindingStore:
                 tokenrouter_user_id=tokenrouter_user_id,
                 email=email,
             )
+        except BindCooldownActive:
+            raise
         except Exception as exc:
             if not _is_duplicate_key_error(exc):
                 raise BindingDatabaseError("写入远程 MySQL 失败") from exc
@@ -175,6 +185,78 @@ class MySQLBindingStore:
             raise BindingDatabaseError("读取远程 MySQL 失败") from exc
         return _row_to_binding(row) if row else None
 
+    async def get_by_user_ids(
+        self,
+        user_ids: list[int] | tuple[int, ...] | set[int],
+    ) -> dict[int, BindingRecord]:
+        await self.initialize()
+        normalized = sorted({int(user_id) for user_id in user_ids if int(user_id) > 0})
+        if not normalized:
+            return {}
+        placeholders = ", ".join("%s" for _ in normalized)
+        sql = (
+            f"SELECT qq_id, tokenrouter_user_id, email FROM `{self.table}` "
+            f"WHERE tokenrouter_user_id IN ({placeholders})"
+        )
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql, tuple(normalized))
+                    rows = await cursor.fetchall()
+        except Exception as exc:
+            raise BindingDatabaseError("读取远程 MySQL 失败") from exc
+        records = (_row_to_binding(row) for row in rows)
+        return {record.tokenrouter_user_id: record for record in records}
+
+    async def unbind(
+        self,
+        *,
+        qq_id: str,
+        expected_user_id: int,
+        cooldown_seconds: int,
+    ) -> bool:
+        await self.initialize()
+        safe_cooldown = max(0, min(int(cooldown_seconds), 2_592_000))
+        try:
+            async with self._pool.acquire() as connection:
+                await connection.begin()
+                try:
+                    async with connection.cursor() as cursor:
+                        await cursor.execute(
+                            f"SELECT tokenrouter_user_id FROM `{self.table}` "
+                            "WHERE qq_id = %s FOR UPDATE",
+                            (qq_id,),
+                        )
+                        row = await cursor.fetchone()
+                        if row is None or int(row["tokenrouter_user_id"]) != int(
+                            expected_user_id
+                        ):
+                            await connection.rollback()
+                            return False
+                        await cursor.execute(
+                            f"DELETE FROM `{self.table}` WHERE qq_id = %s "
+                            "AND tokenrouter_user_id = %s",
+                            (qq_id, expected_user_id),
+                        )
+                        if cursor.rowcount != 1:
+                            await connection.rollback()
+                            return False
+                        if safe_cooldown > 0:
+                            await cursor.execute(
+                                f"INSERT INTO `{self.cooldown_table}` "
+                                "(qq_id, next_bind_at) VALUES (%s, "
+                                "TIMESTAMPADD(SECOND, %s, UTC_TIMESTAMP(6))) "
+                                "ON DUPLICATE KEY UPDATE next_bind_at = VALUES(next_bind_at)",
+                                (qq_id, safe_cooldown),
+                            )
+                    await connection.commit()
+                    return True
+                except Exception:
+                    await connection.rollback()
+                    raise
+        except Exception as exc:
+            raise BindingDatabaseError("解除绑定失败") from exc
+
     async def _bind_once(
         self,
         *,
@@ -199,6 +281,17 @@ class MySQLBindingStore:
                 if existing is not None:
                     await connection.commit()
                     return existing
+
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        f"SELECT CEIL(GREATEST(0, TIMESTAMPDIFF(MICROSECOND, "
+                        "UTC_TIMESTAMP(6), next_bind_at)) / 1000000) AS retry_after "
+                        f"FROM `{self.cooldown_table}` WHERE qq_id = %s FOR UPDATE",
+                        (qq_id,),
+                    )
+                    cooldown = await cursor.fetchone()
+                if cooldown and int(cooldown.get("retry_after") or 0) > 0:
+                    raise BindCooldownActive(int(cooldown["retry_after"]))
 
                 sql = (
                     f"INSERT INTO `{self.table}` "
@@ -256,10 +349,22 @@ class MySQLBindingStore:
                 UNIQUE KEY uq_fapi_tokenrouter_user_id (tokenrouter_user_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """
+        cooldown_sql = f"""
+            CREATE TABLE IF NOT EXISTS `{self.cooldown_table}` (
+                qq_id VARCHAR(128) CHARACTER SET utf8mb4
+                    COLLATE utf8mb4_bin NOT NULL,
+                next_bind_at DATETIME(6) NOT NULL,
+                updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ON UPDATE CURRENT_TIMESTAMP(6),
+                PRIMARY KEY (qq_id),
+                KEY idx_fapi_binding_cooldown (next_bind_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
         async with self._pool.acquire() as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute(sql)
                 await self._ensure_platform_id_column(cursor)
+                await cursor.execute(cooldown_sql)
             await connection.commit()
 
     async def _ensure_platform_id_column(self, cursor: Any) -> None:
@@ -295,6 +400,10 @@ class MySQLBindingStore:
             raise BindingDatabaseError("MySQL 端口不正确")
         if not _IDENTIFIER_PATTERN.fullmatch(self.table):
             raise BindingDatabaseError("MySQL 表名不合法")
+        if not _IDENTIFIER_PATTERN.fullmatch(self.cooldown_table):
+            raise BindingDatabaseError("MySQL 解绑冷却表名不合法")
+        if self.table.casefold() == self.cooldown_table.casefold():
+            raise BindingDatabaseError("绑定表和解绑冷却表不能同名")
 
     def _ssl_context(self) -> ssl.SSLContext | None:
         if not self.ssl_enabled:

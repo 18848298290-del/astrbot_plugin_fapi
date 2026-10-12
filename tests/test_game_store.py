@@ -508,6 +508,33 @@ class StateTransitionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("refund_attempt_count = 0", sql)
         self.assertEqual(params, ("operation-1",))
 
+    async def test_pending_operation_can_be_expedited_without_new_task(self):
+        store, cursor, _ = make_store(FakeCursor(rowcounts=[1]))
+
+        changed = await store.retry_pending("operation-1")
+
+        self.assertTrue(changed)
+        sql, params = cursor.executions[0]
+        self.assertIn("next_attempt_at = UTC_TIMESTAMP(6)", sql)
+        self.assertNotIn("INSERT", sql)
+        self.assertEqual(params[0], "operation-1")
+        self.assertEqual(params[1:], (
+            "pending_debit",
+            "pending_credit",
+            "pending_refund",
+        ))
+
+    async def test_incomplete_list_includes_manual_review_without_due_filter(self):
+        rows = [operation_row(status="manual_review")]
+        store, cursor, _ = make_store(FakeCursor([rows]))
+
+        operations = await store.list_incomplete(limit=10)
+
+        self.assertEqual(operations[0].status, GameStatus.MANUAL_REVIEW)
+        sql, params = cursor.executions[0]
+        self.assertNotIn("next_attempt_at <=", sql)
+        self.assertIn("manual_review", params)
+
     async def test_mark_debited_selects_credit_or_success_in_sql(self):
         store, cursor, _ = make_store()
 

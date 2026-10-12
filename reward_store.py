@@ -54,6 +54,7 @@ class RewardJob:
     status: RewardJobStatus
     attempt_count: int
     first_attempt_at: datetime | None = None
+    created_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +85,33 @@ class RedPacketClaimReservation:
     packet_id: int
     job: RewardJob
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RewardRankingEntry:
+    tokenrouter_user_id: int
+    count: int
+    amount_units: int
+
+
+@dataclass(frozen=True, slots=True)
+class RewardLedgerEntry:
+    operation_id: str
+    source_type: str
+    amount_units: int
+    status: RewardJobStatus
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class DailyRewardStats:
+    reward_date: date
+    checkin_count: int
+    checkin_units: int
+    red_packet_count: int
+    red_packet_units: int
+    claim_count: int
+    claim_units: int
 
 
 def money_to_units(value: Any, *, allow_zero: bool = False) -> int:
@@ -594,6 +622,174 @@ class MySQLRewardStore:
             raise RewardDatabaseError("读取待发奖励失败") from exc
         return [_row_to_job(row) for row in rows]
 
+    async def list_incomplete_jobs(self, limit: int = 20) -> list[RewardJob]:
+        await self.initialize()
+        safe_limit = max(1, min(int(limit), 100))
+        sql = f"""
+            SELECT * FROM `{self.jobs_table}`
+            WHERE status = 'pending'
+            ORDER BY created_at ASC
+            LIMIT {safe_limit}
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql)
+                    rows = await cursor.fetchall()
+        except Exception as exc:
+            raise RewardDatabaseError("读取未完成奖励任务失败") from exc
+        return [_row_to_job(row) for row in rows]
+
+    async def retry_reward_job(self, operation_id: str) -> bool:
+        await self.initialize()
+        sql = f"""
+            UPDATE `{self.jobs_table}`
+            SET next_attempt_at = UTC_TIMESTAMP(6),
+                updated_at = UTC_TIMESTAMP(6)
+            WHERE operation_id = %s AND status = 'pending'
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql, (operation_id,))
+                    return cursor.rowcount == 1
+        except Exception as exc:
+            raise RewardDatabaseError("重新排队奖励任务失败") from exc
+
+    async def get_ranking(
+        self,
+        *,
+        source_type: str,
+        limit: int = 10,
+    ) -> list[RewardRankingEntry]:
+        if source_type not in {"checkin", "red_packet"}:
+            raise ValueError("不支持的奖励排行类型")
+        await self.initialize()
+        safe_limit = max(1, min(int(limit), 20))
+        sql = f"""
+            SELECT tokenrouter_user_id, COUNT(*) AS entry_count,
+                   COALESCE(SUM(amount_units), 0) AS amount_units
+            FROM `{self.jobs_table}`
+            WHERE source_type = %s AND status = 'succeeded'
+            GROUP BY tokenrouter_user_id
+            ORDER BY entry_count DESC, amount_units DESC, tokenrouter_user_id ASC
+            LIMIT {safe_limit}
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql, (source_type,))
+                    rows = await cursor.fetchall()
+        except Exception as exc:
+            raise RewardDatabaseError("读取奖励排行失败") from exc
+        return [
+            RewardRankingEntry(
+                tokenrouter_user_id=int(row["tokenrouter_user_id"]),
+                count=int(row["entry_count"]),
+                amount_units=int(row["amount_units"]),
+            )
+            for row in rows
+        ]
+
+    async def get_user_ledger(
+        self,
+        tokenrouter_user_id: int,
+        *,
+        limit: int = 20,
+    ) -> list[RewardLedgerEntry]:
+        await self.initialize()
+        safe_limit = max(1, min(int(limit), 50))
+        sql = f"""
+            SELECT operation_id, source_type, amount_units, status, created_at
+            FROM `{self.jobs_table}`
+            WHERE tokenrouter_user_id = %s
+            ORDER BY created_at DESC
+            LIMIT {safe_limit}
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql, (tokenrouter_user_id,))
+                    rows = await cursor.fetchall()
+        except Exception as exc:
+            raise RewardDatabaseError("读取用户奖励账单失败") from exc
+        return [
+            RewardLedgerEntry(
+                operation_id=str(row["operation_id"]),
+                source_type=str(row["source_type"]),
+                amount_units=int(row["amount_units"]),
+                status=RewardJobStatus(str(row["status"])),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    async def get_daily_stats(
+        self,
+        *,
+        reward_date: date,
+        start_utc: datetime,
+        end_utc: datetime,
+    ) -> DailyRewardStats:
+        await self.initialize()
+        sql = f"""
+            SELECT
+                (SELECT COUNT(*) FROM `{self.checkins_table}` c
+                 JOIN `{self.jobs_table}` j ON j.operation_id = c.operation_id
+                 WHERE c.reward_date = %s AND j.status = 'succeeded')
+                    AS checkin_count,
+                (SELECT COALESCE(SUM(c.amount_units), 0)
+                 FROM `{self.checkins_table}` c
+                 JOIN `{self.jobs_table}` j ON j.operation_id = c.operation_id
+                 WHERE c.reward_date = %s AND j.status = 'succeeded')
+                    AS checkin_units,
+                (SELECT COUNT(*) FROM `{self.packets_table}`
+                 WHERE created_at >= %s AND created_at < %s)
+                    AS red_packet_count,
+                (SELECT COALESCE(SUM(total_units), 0) FROM `{self.packets_table}`
+                 WHERE created_at >= %s AND created_at < %s)
+                    AS red_packet_units,
+                (SELECT COUNT(*) FROM `{self.claims_table}` c
+                 JOIN `{self.jobs_table}` j ON j.operation_id = c.operation_id
+                 WHERE c.created_at >= %s AND c.created_at < %s
+                   AND j.status = 'succeeded') AS claim_count,
+                (SELECT COALESCE(SUM(c.amount_units), 0)
+                 FROM `{self.claims_table}` c
+                 JOIN `{self.jobs_table}` j ON j.operation_id = c.operation_id
+                 WHERE c.created_at >= %s AND c.created_at < %s
+                   AND j.status = 'succeeded') AS claim_units
+        """
+        values = (
+            reward_date,
+            reward_date,
+            start_utc,
+            end_utc,
+            start_utc,
+            end_utc,
+            start_utc,
+            end_utc,
+            start_utc,
+            end_utc,
+        )
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql, values)
+                    row = await cursor.fetchone()
+        except Exception as exc:
+            raise RewardDatabaseError("读取每日奖励统计失败") from exc
+        if row is None:
+            raise RewardDatabaseError("每日奖励统计响应为空")
+        return DailyRewardStats(
+            reward_date=reward_date,
+            checkin_count=int(row["checkin_count"]),
+            checkin_units=int(row["checkin_units"]),
+            red_packet_count=int(row["red_packet_count"]),
+            red_packet_units=int(row["red_packet_units"]),
+            claim_count=int(row["claim_count"]),
+            claim_units=int(row["claim_units"]),
+        )
+
     async def record_reward_attempt(self, operation_id: str) -> None:
         await self.initialize()
         sql = f"""
@@ -1046,6 +1242,7 @@ def _row_to_job(row: dict[str, Any]) -> RewardJob:
         status=RewardJobStatus(str(row["status"])),
         attempt_count=int(row["attempt_count"]),
         first_attempt_at=row.get("first_attempt_at"),
+        created_at=row.get("created_at"),
     )
 
 

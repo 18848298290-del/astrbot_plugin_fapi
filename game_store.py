@@ -610,6 +610,69 @@ class MySQLGameStore:
             expected_rows=1,
         )
 
+    async def retry_pending(self, operation_id: str) -> bool:
+        await self.initialize()
+        placeholders = ", ".join("%s" for _ in _PENDING_STATUSES)
+        sql = f"""
+            UPDATE `{self.table}`
+            SET next_attempt_at = UTC_TIMESTAMP(6),
+                updated_at = UTC_TIMESTAMP(6)
+            WHERE operation_id = %s AND status IN ({placeholders})
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql, (operation_id, *_PENDING_STATUSES))
+                    return cursor.rowcount == 1
+        except Exception as exc:
+            raise GameDatabaseError("unable to requeue pending game operation") from exc
+
+    async def list_incomplete(self, limit: int = 20) -> list[GameOperation]:
+        await self.initialize()
+        safe_limit = max(1, min(int(limit), 100))
+        statuses = (*_PENDING_STATUSES, GameStatus.MANUAL_REVIEW.value)
+        placeholders = ", ".join("%s" for _ in statuses)
+        sql = f"""
+            SELECT * FROM `{self.table}`
+            WHERE status IN ({placeholders})
+            ORDER BY created_at ASC
+            LIMIT {safe_limit}
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql, statuses)
+                    rows = await cursor.fetchall()
+        except Exception as exc:
+            raise GameDatabaseError("unable to list incomplete game operations") from exc
+        return [_row_to_operation(row) for row in rows]
+
+    async def get_user_operations(
+        self,
+        tokenrouter_user_id: int,
+        *,
+        limit: int = 20,
+    ) -> list[GameOperation]:
+        await self.initialize()
+        safe_limit = max(1, min(int(limit), 50))
+        sql = f"""
+            SELECT * FROM `{self.table}`
+            WHERE debit_user_id = %s OR credit_user_id = %s
+            ORDER BY created_at DESC
+            LIMIT {safe_limit}
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        sql,
+                        (tokenrouter_user_id, tokenrouter_user_id),
+                    )
+                    rows = await cursor.fetchall()
+        except Exception as exc:
+            raise GameDatabaseError("unable to read user game operations") from exc
+        return [_row_to_operation(row) for row in rows]
+
     async def list_pending(self, limit: int = 20) -> list[GameOperation]:
         await self.initialize()
         safe_limit = max(1, min(int(limit), 100))

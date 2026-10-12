@@ -432,5 +432,91 @@ class RedPacketIdempotencyTest(unittest.IsolatedAsyncioTestCase):
             )
 
 
+class RewardReportingTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def store_with_cursor(cursor):
+        class Connection:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def cursor(self):
+                return cursor
+
+        class Pool:
+            def acquire(self):
+                return Connection()
+
+        store = MySQLRewardStore(
+            host="db.example.com",
+            port=3306,
+            user="fapi",
+            password="secret",
+            database="astrbot",
+        )
+        store._pool = Pool()
+        return store
+
+    async def test_ranking_only_uses_succeeded_jobs(self):
+        class Cursor:
+            def __init__(self):
+                self.sql = ""
+                self.params = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def execute(self, sql, params=None):
+                self.sql = sql
+                self.params = params
+
+            async def fetchall(self):
+                return [
+                    {
+                        "tokenrouter_user_id": 7,
+                        "entry_count": 3,
+                        "amount_units": 15_000_000,
+                    }
+                ]
+
+        cursor = Cursor()
+        entries = await self.store_with_cursor(cursor).get_ranking(
+            source_type="checkin",
+            limit=10,
+        )
+
+        self.assertEqual(entries[0].count, 3)
+        self.assertIn("status = 'succeeded'", cursor.sql)
+        self.assertEqual(cursor.params, ("checkin",))
+
+    async def test_reward_retry_only_updates_existing_pending_job(self):
+        class Cursor:
+            rowcount = 1
+
+            def __init__(self):
+                self.sql = ""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def execute(self, sql, _params=None):
+                self.sql = sql
+
+        cursor = Cursor()
+        changed = await self.store_with_cursor(cursor).retry_reward_job("job-1")
+
+        self.assertTrue(changed)
+        self.assertIn("status = 'pending'", cursor.sql)
+        self.assertNotIn("INSERT", cursor.sql)
+
+
 if __name__ == "__main__":
     unittest.main()

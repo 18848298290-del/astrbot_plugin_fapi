@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import inspect
@@ -16,7 +16,12 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 
-from .binding_store import BindStatus, BindingDatabaseError, MySQLBindingStore
+from .binding_store import (
+    BindCooldownActive,
+    BindStatus,
+    BindingDatabaseError,
+    MySQLBindingStore,
+)
 from .game_store import (
     GameCooldownActive,
     GameDatabaseError,
@@ -29,6 +34,7 @@ from .game_store import (
 from .reward_store import (
     MIN_RED_PACKET_UNITS,
     CheckinReservation,
+    DailyRewardStats,
     MySQLRewardStore,
     RedPacketClaimReservation,
     RedPacketUnavailable,
@@ -92,7 +98,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和打劫",
-    "3.9.0",
+    "4.0.0",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -113,6 +119,12 @@ class FapiPlugin(Star):
         table_names = {
             "mysql_table": str(
                 config.get("mysql_table", "astrbot_fapi_bindings")
+            ).strip(),
+            "mysql_binding_cooldowns_table": str(
+                config.get(
+                    "mysql_binding_cooldowns_table",
+                    "astrbot_fapi_binding_cooldowns",
+                )
             ).strip(),
             "mysql_reward_jobs_table": str(
                 config.get("mysql_reward_jobs_table", "astrbot_fapi_reward_jobs")
@@ -160,6 +172,7 @@ class FapiPlugin(Star):
             password=str(config.get("mysql_password", "")),
             database=str(config.get("mysql_database", "")),
             table=table_names["mysql_table"],
+            cooldown_table=table_names["mysql_binding_cooldowns_table"],
             connect_timeout=int(config.get("mysql_connect_timeout", 10)),
             ssl_enabled=bool(config.get("mysql_ssl_enabled", True)),
             ssl_verify=bool(config.get("mysql_ssl_verify", True)),
@@ -192,6 +205,40 @@ class FapiPlugin(Star):
         self._game_command_lock = asyncio.Lock()
         self._game_delivery_lock = asyncio.Lock()
         self._game_worker_task: asyncio.Task | None = None
+        self._daily_broadcast_task: asyncio.Task | None = None
+        self._unbind_confirmations: dict[tuple[str, str], tuple[int, float]] = {}
+        self._unbind_confirmation_seconds = 60
+        self._unbind_cooldown_seconds = max(
+            0,
+            min(int(config.get("unbind_cooldown_seconds", 3600)), 2_592_000),
+        )
+        self._daily_broadcast_enabled = bool(
+            config.get("daily_broadcast_enabled", False)
+        )
+        self._daily_broadcast_umo = str(
+            config.get("daily_broadcast_umo", "")
+        ).strip()
+        self._daily_broadcast_error = ""
+        try:
+            broadcast_time = str(
+                config.get("daily_broadcast_time", "23:55")
+            ).strip()
+            broadcast_hour, broadcast_minute = (
+                int(part) for part in broadcast_time.split(":")
+            )
+            if not 0 <= broadcast_hour <= 23 or not 0 <= broadcast_minute <= 59:
+                raise ValueError
+            self._daily_broadcast_hour = broadcast_hour
+            self._daily_broadcast_minute = broadcast_minute
+        except (TypeError, ValueError):
+            self._daily_broadcast_hour = 23
+            self._daily_broadcast_minute = 55
+            self._daily_broadcast_error = "每日播报时间必须使用 HH:MM 格式"
+        if self._daily_broadcast_enabled:
+            if not self._daily_broadcast_umo:
+                self._daily_broadcast_error = "已开启每日播报但未配置 UMO"
+            elif self._daily_broadcast_umo.rsplit(":", 1)[-1] != self._allowed_group_id:
+                self._daily_broadcast_error = "每日播报 UMO 与指定群不一致"
         self._game_claim_lease_seconds = max(
             180,
             min(3600, math.ceil(request_timeout) * 4 + 60),
@@ -291,6 +338,8 @@ class FapiPlugin(Star):
             await self.games.initialize()
         except GameDatabaseError as exc:
             logger.error("FAPI 游戏数据表初始化失败：%s", exc)
+        if self._daily_broadcast_error:
+            logger.error("FAPI 每日播报配置无效：%s", self._daily_broadcast_error)
         self._ensure_background_workers()
 
     @filter.command_group("fapi")
@@ -331,7 +380,11 @@ class FapiPlugin(Star):
                 "/fapi 管理 概览\n"
                 "/fapi 管理 RPM [邮箱]\n"
                 "/fapi 管理 排行 [数量]\n"
-                "/fapi 管理 查询 <邮箱>\n"
+                "/fapi 管理 状态 <邮箱>\n"
+                "/fapi 管理 查询 <邮箱>（状态的别名）\n"
+                "/fapi 管理 账单 <邮箱>\n"
+                "/fapi 管理 未完成任务 [数量]\n"
+                "/fapi 管理 重试 <任务编号>\n"
                 "/fapi 管理 加余额 <邮箱> <金额>\n"
                 "/fapi 管理 减余额 <邮箱> <金额>\n\n"
                 "排行默认 10 人、最多 20 人；邮箱必须完全一致；"
@@ -352,9 +405,18 @@ class FapiPlugin(Star):
             "ranking": "ranking",
             "rank": "ranking",
             "查询": "query",
+            "状态": "query",
             "用户": "query",
             "query": "query",
             "user": "query",
+            "账单": "ledger",
+            "流水": "ledger",
+            "bill": "ledger",
+            "未完成任务": "incomplete",
+            "任务": "incomplete",
+            "tasks": "incomplete",
+            "重试": "retry",
+            "retry": "retry",
             "加余额": "add",
             "增加余额": "add",
             "add": "add",
@@ -370,9 +432,9 @@ class FapiPlugin(Star):
 
         email = ""
         amount = ""
-        if operation in {"query", "rpm"}:
+        if operation in {"query", "rpm", "ledger", "retry"}:
             email = arguments
-        elif operation == "ranking":
+        elif operation in {"ranking", "incomplete"}:
             email = arguments
         elif operation in {"add", "subtract"}:
             email, separator, amount = arguments.rpartition(" ")
@@ -405,6 +467,37 @@ class FapiPlugin(Star):
                 yield event.plain_result("管理数据查询暂时不可用，请稍后重试。")
                 return
             yield event.plain_result(self._dashboard_overview_reply(overview))
+            return
+
+        if operation == "incomplete":
+            try:
+                task_limit = 10 if not email.strip() else int(email.strip())
+            except ValueError:
+                task_limit = 0
+            if not 1 <= task_limit <= 20:
+                yield event.plain_result("任务数量必须是 1 到 20 的整数。")
+                return
+            try:
+                reply = await self._incomplete_tasks_reply(task_limit)
+            except (RewardDatabaseError, GameDatabaseError) as exc:
+                logger.error("FAPI 管理员查询未完成任务失败：%s", exc)
+                yield event.plain_result("任务数据库暂时不可用，请稍后重试。")
+                return
+            yield event.plain_result(reply)
+            return
+
+        if operation == "retry":
+            operation_id = email.strip()
+            if not operation_id:
+                yield event.plain_result("用法：/fapi 管理 重试 <任务编号>")
+                return
+            try:
+                retry_reply = await self._retry_task(operation_id)
+            except (RewardDatabaseError, GameDatabaseError) as exc:
+                logger.error("FAPI 管理员重试任务失败：%s", exc)
+                yield event.plain_result("任务数据库暂时不可用，请稍后重试。")
+                return
+            yield event.plain_result(retry_reply)
             return
 
         if operation == "ranking":
@@ -506,6 +599,20 @@ class FapiPlugin(Star):
             yield event.plain_result(user_error)
             return
         assert user is not None
+
+        if operation == "ledger":
+            try:
+                reply = await self._ledger_reply(
+                    user.user_id,
+                    email=user.email,
+                    admin=True,
+                )
+            except (RewardDatabaseError, GameDatabaseError) as exc:
+                logger.error("FAPI 管理员查询用户账单失败：%s", exc)
+                yield event.plain_result("账单数据库暂时不可用，请稍后重试。")
+                return
+            yield event.plain_result(reply)
+            return
 
         if operation == "rpm":
             try:
@@ -639,11 +746,15 @@ class FapiPlugin(Star):
             "FAPI 功能菜单\n"
             f"{binding_usage}\n"
             "/fapi 绑定状态\n"
+            "/fapi 解绑 [确认]\n"
             "/fapi 余额\n"
             "/fapi 签到\n"
+            "/fapi 签到排行\n"
             "/fapi 红包 <总金额> <份数>\n"
             "/fapi 抢红包 [红包编号]\n"
             "/fapi 红包状态 [红包编号]\n"
+            "/fapi 红包排行\n"
+            "/fapi 账单\n"
             "/fapi 打劫 @用户\n"
             "/fapi 帮助\n\n"
             f"{red_packet_permission}"
@@ -717,6 +828,12 @@ class FapiPlugin(Star):
                 tokenrouter_user_id=user.user_id,
                 email=user.email,
             )
+        except BindCooldownActive as exc:
+            yield event.plain_result(
+                "解绑冷却中，请在 "
+                f"{self._format_duration(exc.retry_after_seconds)} 后再绑定。"
+            )
+            return
         except BindingDatabaseError as exc:
             logger.error("FAPI 保存用户绑定失败：%s", exc)
             yield event.plain_result("远程绑定数据库暂时不可用，请联系管理员。")
@@ -761,6 +878,132 @@ class FapiPlugin(Star):
             yield event.plain_result("当前账号尚未绑定中转站账号。")
             return
         yield event.plain_result("当前账号已绑定中转站账号。")
+
+    @fapi.command("解绑", alias={"unbind"})
+    async def unbind(self, event: AstrMessageEvent, confirmation: str = ""):
+        """二次确认后解除绑定，并启用持久化重绑冷却。"""
+        command_context, context_error = self._group_command_context(event)
+        if context_error:
+            yield event.plain_result(context_error)
+            return
+        assert command_context is not None
+        key = (command_context.platform, command_context.sender_id)
+        now = asyncio.get_running_loop().time()
+        stale_keys = [
+            pending_key
+            for pending_key, (_user_id, expires_at) in self._unbind_confirmations.items()
+            if expires_at < now
+        ]
+        for stale_key in stale_keys:
+            self._unbind_confirmations.pop(stale_key, None)
+
+        if confirmation.strip().casefold() not in {"确认", "confirm"}:
+            try:
+                binding = await self.bindings.get_by_qq(command_context.sender_id)
+            except BindingDatabaseError as exc:
+                logger.error("FAPI 查询解绑绑定关系失败：%s", exc)
+                yield event.plain_result("远程绑定数据库暂时不可用，请稍后重试。")
+                return
+            if binding is None:
+                self._unbind_confirmations.pop(key, None)
+                yield event.plain_result("当前账号尚未绑定中转站账号。")
+                return
+            self._unbind_confirmations[key] = (
+                binding.tokenrouter_user_id,
+                now + self._unbind_confirmation_seconds,
+            )
+            yield event.plain_result(
+                "解绑后需等待 "
+                f"{self._format_duration(self._unbind_cooldown_seconds)} 才能重新绑定。\n"
+                "如确认解绑，请在 60 秒内发送：/fapi 解绑 确认"
+            )
+            return
+
+        pending = self._unbind_confirmations.pop(key, None)
+        if pending is None or pending[1] < now:
+            yield event.plain_result("解绑确认已过期，请先重新发送 /fapi 解绑。")
+            return
+        try:
+            removed = await self.bindings.unbind(
+                qq_id=command_context.sender_id,
+                expected_user_id=pending[0],
+                cooldown_seconds=self._unbind_cooldown_seconds,
+            )
+        except BindingDatabaseError as exc:
+            logger.error("FAPI 解除绑定失败：%s", exc)
+            yield event.plain_result("远程绑定数据库暂时不可用，请稍后重试。")
+            return
+        if not removed:
+            yield event.plain_result("绑定状态已经变化，本次解绑已取消，请重新确认。")
+            return
+        yield event.plain_result(
+            "解绑成功。重新绑定冷却："
+            f"{self._format_duration(self._unbind_cooldown_seconds)}。"
+        )
+
+    @fapi.command("签到排行", alias={"checkin_rank"})
+    async def checkin_ranking(self, event: AstrMessageEvent):
+        """显示累计签到次数排行。"""
+        command_context, context_error = self._group_command_context(event)
+        if context_error:
+            yield event.plain_result(context_error)
+            return
+        try:
+            reply = await self._reward_ranking_reply(
+                source_type="checkin",
+                title="签到排行",
+            )
+        except (RewardDatabaseError, BindingDatabaseError) as exc:
+            logger.error("FAPI 查询签到排行失败：%s", exc)
+            yield event.plain_result("排行数据库暂时不可用，请稍后重试。")
+            return
+        yield event.plain_result(reply)
+
+    @fapi.command("红包排行", alias={"redpacket_rank"})
+    async def red_packet_ranking(self, event: AstrMessageEvent):
+        """显示累计成功领取红包次数排行。"""
+        command_context, context_error = self._group_command_context(event)
+        if context_error:
+            yield event.plain_result(context_error)
+            return
+        try:
+            reply = await self._reward_ranking_reply(
+                source_type="red_packet",
+                title="抢红包排行",
+            )
+        except (RewardDatabaseError, BindingDatabaseError) as exc:
+            logger.error("FAPI 查询红包排行失败：%s", exc)
+            yield event.plain_result("排行数据库暂时不可用，请稍后重试。")
+            return
+        yield event.plain_result(reply)
+
+    @fapi.command("账单", alias={"bill"})
+    async def ledger(self, event: AstrMessageEvent):
+        """显示当前绑定账号最近的插件余额记录。"""
+        command_context, context_error = self._group_command_context(event)
+        if context_error:
+            yield event.plain_result(context_error)
+            return
+        try:
+            binding = await self.bindings.get_by_qq(command_context.sender_id)
+        except BindingDatabaseError as exc:
+            logger.error("FAPI 查询账单绑定关系失败：%s", exc)
+            yield event.plain_result("远程绑定数据库暂时不可用，请稍后重试。")
+            return
+        if binding is None:
+            yield event.plain_result("当前账号尚未绑定中转站账号，请先使用 /fapi 绑定。")
+            return
+        try:
+            reply = await self._ledger_reply(
+                binding.tokenrouter_user_id,
+                email=binding.email,
+                admin=False,
+            )
+        except (RewardDatabaseError, GameDatabaseError) as exc:
+            logger.error("FAPI 查询用户账单失败：%s", exc)
+            yield event.plain_result("账单数据库暂时不可用，请稍后重试。")
+            return
+        yield event.plain_result(reply)
 
     @fapi.command("余额", alias={"balance"})
     async def balance(self, event: AstrMessageEvent):
@@ -1153,6 +1396,7 @@ class FapiPlugin(Star):
 
     async def terminate(self) -> None:
         for attribute, task_name in (
+            ("_daily_broadcast_task", "每日播报"),
             ("_game_worker_task", "游戏结算"),
             ("_reward_worker_task", "奖励补发"),
         ):
@@ -1462,6 +1706,68 @@ class FapiPlugin(Star):
                 logger.exception("FAPI 游戏结算补偿任务执行失败")
             await asyncio.sleep(15)
 
+    async def _daily_broadcast_loop(self) -> None:
+        while True:
+            now = datetime.now(self._reward_timezone)
+            next_run = now.replace(
+                hour=self._daily_broadcast_hour,
+                minute=self._daily_broadcast_minute,
+                second=0,
+                microsecond=0,
+            )
+            if next_run <= now:
+                next_run += timedelta(days=1)
+            await asyncio.sleep(max(1.0, (next_run - now).total_seconds()))
+            try:
+                await self._send_daily_broadcast()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("FAPI 每日自动播报失败")
+
+    async def _send_daily_broadcast(self) -> None:
+        overview = await self.client.get_dashboard_overview()
+        report_date, start_utc, end_utc = self._daily_stats_window()
+        stats = await self.rewards.get_daily_stats(
+            reward_date=report_date,
+            start_utc=start_utc,
+            end_utc=end_utc,
+        )
+        from astrbot.api.event import MessageChain
+
+        chain = MessageChain().message(
+            self._daily_broadcast_reply(overview, stats)
+        )
+        await self.context.send_message(self._daily_broadcast_umo, chain)
+
+    def _daily_stats_window(self) -> tuple[date, datetime, datetime]:
+        now = datetime.now(self._reward_timezone)
+        start_local = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_local = start_local + timedelta(days=1)
+        start_utc = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+        end_utc = end_local.astimezone(timezone.utc).replace(tzinfo=None)
+        return now.date(), start_utc, end_utc
+
+    @staticmethod
+    def _daily_broadcast_reply(
+        overview: TokenRouterDashboardOverview,
+        stats: DailyRewardStats,
+    ) -> str:
+        freshness = "（统计可能延迟）" if overview.stats_stale else ""
+        return (
+            f"FAPI 每日播报 {stats.reward_date.isoformat()}{freshness}\n"
+            f"全站请求：{overview.today_requests:,}\n"
+            f"全站 Token：{overview.today_tokens:,}\n"
+            f"全站消费：{FapiPlugin._format_usd(overview.today_actual_cost)}\n"
+            f"签到：{stats.checkin_count:,} 人 / "
+            f"{FapiPlugin._format_units(stats.checkin_units)}\n"
+            f"红包：创建 {stats.red_packet_count:,} 个 / "
+            f"{FapiPlugin._format_units(stats.red_packet_units)}\n"
+            f"红包到账：{stats.claim_count:,} 份 / "
+            f"{FapiPlugin._format_units(stats.claim_units)}\n"
+            f"实时吞吐：RPM {overview.rpm:,} / TPM {overview.tpm:,}"
+        )
+
     def _ensure_background_workers(self) -> None:
         if self._reward_worker_task is None or self._reward_worker_task.done():
             self._reward_worker_task = asyncio.create_task(
@@ -1472,6 +1778,19 @@ class FapiPlugin(Star):
             self._game_worker_task = asyncio.create_task(
                 self._game_worker_loop(),
                 name="fapi-game-worker",
+            )
+        if (
+            self._daily_broadcast_enabled
+            and not self._daily_broadcast_error
+            and self._daily_broadcast_umo
+            and (
+                self._daily_broadcast_task is None
+                or self._daily_broadcast_task.done()
+            )
+        ):
+            self._daily_broadcast_task = asyncio.create_task(
+                self._daily_broadcast_loop(),
+                name="fapi-daily-broadcast",
             )
 
     @staticmethod
@@ -1756,6 +2075,176 @@ class FapiPlugin(Star):
                 f"{item.requests:,} 次 / {item.tokens:,} Token"
             )
         return "\n".join(lines)
+
+    async def _reward_ranking_reply(self, *, source_type: str, title: str) -> str:
+        entries = await self.rewards.get_ranking(source_type=source_type, limit=10)
+        if not entries:
+            return f"{title}\n暂无已到账记录。"
+        bindings = await self.bindings.get_by_user_ids(
+            {entry.tokenrouter_user_id for entry in entries}
+        )
+        lines = [title]
+        for index, entry in enumerate(entries, start=1):
+            binding = bindings.get(entry.tokenrouter_user_id)
+            identity = (
+                self._mask_email(binding.email)
+                if binding is not None
+                else "已解绑用户"
+            )
+            label = "天" if source_type == "checkin" else "份"
+            lines.append(
+                f"{index}. {identity}：{entry.count} {label} / "
+                f"{self._format_units(entry.amount_units)}"
+            )
+        return "\n".join(lines)
+
+    async def _ledger_reply(
+        self,
+        tokenrouter_user_id: int,
+        *,
+        email: str,
+        admin: bool,
+    ) -> str:
+        reward_entries, game_entries = await asyncio.gather(
+            self.rewards.get_user_ledger(tokenrouter_user_id, limit=20),
+            self.games.get_user_operations(tokenrouter_user_id, limit=20),
+        )
+        rows: list[tuple[float, str]] = []
+        reward_labels = {"checkin": "签到", "red_packet": "红包"}
+        for entry in reward_entries:
+            status = "已到账" if entry.status == RewardJobStatus.SUCCEEDED else "待补发"
+            label = reward_labels.get(entry.source_type, "奖励")
+            rows.append(
+                (
+                    self._datetime_sort_key(entry.created_at),
+                    f"{self._format_ledger_time(entry.created_at)} {label} "
+                    f"+{self._format_units(entry.amount_units)}（{status}）",
+                )
+            )
+        for operation in game_entries:
+            line = self._game_ledger_line(operation, tokenrouter_user_id)
+            if line:
+                rows.append((self._datetime_sort_key(operation.created_at), line))
+        rows.sort(key=lambda item: item[0], reverse=True)
+
+        shown_email = (
+            self._safe_reply_field(email)
+            if admin
+            else self._mask_email(email)
+        )
+        lines = [f"插件账单：{shown_email}"]
+        if not rows:
+            lines.append("暂无签到、红包或打劫记录。")
+            return "\n".join(lines)
+        lines.extend(line for _, line in rows[:10])
+        lines.append("仅显示最近 10 条插件记录，不含站内其他消费与调账。")
+        return "\n".join(lines)
+
+    def _game_ledger_line(
+        self,
+        operation: GameOperation,
+        tokenrouter_user_id: int,
+    ) -> str:
+        timestamp = self._format_ledger_time(operation.created_at)
+        is_debit = operation.debit_user_id == tokenrouter_user_id
+        is_credit = operation.credit_user_id == tokenrouter_user_id
+        if not is_debit and not is_credit:
+            return ""
+        role = "支出" if is_debit else "收入"
+        units = operation.debit_units if is_debit else operation.credit_units
+        sign = "-" if is_debit else "+"
+        status_labels = {
+            GameStatus.PENDING_DEBIT: "待扣款",
+            GameStatus.PENDING_CREDIT: "待入账" if is_credit else "已扣款，待对方入账",
+            GameStatus.PENDING_REFUND: "退款中",
+            GameStatus.SUCCEEDED: "已完成",
+            GameStatus.INSUFFICIENT: "余额不足，未变动",
+            GameStatus.FAILED: "失败，未变动",
+            GameStatus.REFUNDED: "已退款",
+            GameStatus.MANUAL_REVIEW: "退款待人工处理",
+        }
+        status = status_labels.get(operation.status, operation.status.value)
+        if operation.status in {
+            GameStatus.INSUFFICIENT,
+            GameStatus.FAILED,
+            GameStatus.REFUNDED,
+        }:
+            amount = self._format_units(0)
+            sign = ""
+        else:
+            amount = self._format_units(units)
+        return f"{timestamp} 打劫{role} {sign}{amount}（{status}）"
+
+    async def _incomplete_tasks_reply(self, limit: int) -> str:
+        reward_jobs, game_operations = await asyncio.gather(
+            self.rewards.list_incomplete_jobs(limit=limit),
+            self.games.list_incomplete(limit=limit),
+        )
+        tasks: list[tuple[float, str]] = []
+        for job in reward_jobs:
+            error = self._safe_reply_field(job.operation_id, maximum=36)
+            tasks.append(
+                (
+                    self._datetime_sort_key(job.created_at),
+                    f"奖励 {error} | {job.source_type} | pending | 尝试 {job.attempt_count}",
+                )
+            )
+        for operation in game_operations:
+            operation_id = self._safe_reply_field(operation.operation_id, maximum=36)
+            tasks.append(
+                (
+                    self._datetime_sort_key(operation.created_at),
+                    f"游戏 {operation_id} | {operation.game_type} | "
+                    f"{operation.status.value} | 尝试 {operation.attempt_count}",
+                )
+            )
+        tasks.sort(key=lambda item: item[0])
+        if not tasks:
+            return "未完成任务\n当前没有待补偿或待人工处理的任务。"
+        lines = ["未完成任务"]
+        lines.extend(text for _, text in tasks[:limit])
+        lines.append("重试：/fapi 管理 重试 <完整任务编号>")
+        return "\n".join(lines)
+
+    async def _retry_task(self, operation_id: str) -> str:
+        if len(operation_id) > 64 or not operation_id.isascii():
+            return "任务编号格式不正确。"
+        reward_job = await self.rewards.get_reward_job(operation_id)
+        if reward_job is not None:
+            if reward_job.status == RewardJobStatus.SUCCEEDED:
+                return "该奖励任务已经完成，不会重复发放。"
+            if await self.rewards.retry_reward_job(operation_id):
+                return "奖励任务已重新排队，固定兑换码不变，不会重复入账。"
+            return "奖励任务状态已经变化，请重新查询。"
+
+        operation = await self.games.get(operation_id)
+        if operation is None:
+            return "未找到该任务编号。"
+        if operation.status == GameStatus.MANUAL_REVIEW:
+            await self.games.retry_manual_review(operation_id)
+            return "人工退款任务已重新排队，固定幂等键不变。"
+        if operation.status in {
+            GameStatus.PENDING_DEBIT,
+            GameStatus.PENDING_CREDIT,
+            GameStatus.PENDING_REFUND,
+        }:
+            if await self.games.retry_pending(operation_id):
+                return "游戏结算任务已提前重试，固定幂等键不变。"
+            return "游戏任务状态已经变化，请重新查询。"
+        return f"该游戏任务已是终态（{operation.status.value}），不会重复处理。"
+
+    @staticmethod
+    def _datetime_sort_key(value: datetime | None) -> float:
+        if value is None:
+            return 0.0
+        normalized = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return normalized.timestamp()
+
+    def _format_ledger_time(self, value: datetime | None) -> str:
+        if value is None:
+            return "时间未知"
+        normalized = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return normalized.astimezone(self._reward_timezone).strftime("%m-%d %H:%M")
 
     def _group_command_context(
         self,
@@ -2042,6 +2531,22 @@ class FapiPlugin(Star):
     @staticmethod
     def _format_units(units: int) -> str:
         return FapiPlugin._format_usd(units_to_decimal(units))
+
+    @staticmethod
+    def _format_duration(seconds: int) -> str:
+        safe_seconds = max(0, int(seconds))
+        if safe_seconds == 0:
+            return "无需等待"
+        hours, remainder = divmod(safe_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        parts: list[str] = []
+        if hours:
+            parts.append(f"{hours} 小时")
+        if minutes:
+            parts.append(f"{minutes} 分钟")
+        if seconds and not hours:
+            parts.append(f"{seconds} 秒")
+        return " ".join(parts)
 
     @staticmethod
     def _api_error_reply(exc: TokenRouterError) -> str:
