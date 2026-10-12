@@ -52,7 +52,6 @@ from .tokenrouter_client import (
 
 _SUPPORTED_QQ_PLATFORMS = frozenset({"aiocqhttp", "qq_official"})
 _GAME_REFUND_MAX_ATTEMPTS = 5
-_SLOT_ANIMATION_DELAY_SECONDS = 1.2
 _REPLY_MARKUP_TRANSLATION = str.maketrans(
     {
         "\\": "＼",
@@ -92,8 +91,8 @@ class PrivateAdminContext:
 @register(
     "astrbot_plugin_fapi",
     "FAPI",
-    "QQ 与 TokenRouter 账号互通、签到、群红包和余额游戏",
-    "3.8.0",
+    "QQ 与 TokenRouter 账号互通、签到、群红包和打劫",
+    "3.9.0",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -268,34 +267,14 @@ class FapiPlugin(Star):
             self._robbery_cooldown_seconds = int(
                 config.get("robbery_cooldown_seconds", 300)
             )
-            self._slot_enabled = bool(config.get("slot_enabled", True))
-            self._slot_animation_enabled = bool(
-                config.get("slot_animation_enabled", True)
-            )
-            self._slot_animation_delay_seconds = _SLOT_ANIMATION_DELAY_SECONDS
-            self._slot_cost_units = money_to_units(config.get("slot_cost", "0.10"))
-            self._slot_prize_units = money_to_units(
-                config.get("slot_prize", "0.20")
-            )
-            self._slot_success_rate = int(config.get("slot_success_rate", 40))
-            self._slot_cooldown_seconds = int(
-                config.get("slot_cooldown_seconds", 10)
-            )
             for name, rate in (
                 ("打劫", self._robbery_success_rate),
                 ("打劫反噬", self._robbery_backfire_rate),
-                ("老虎机", self._slot_success_rate),
             ):
                 if not 0 <= rate <= 100:
                     raise ValueError(f"{name}成功率必须在 0 到 100 之间")
-            for name, cooldown in (
-                ("打劫", self._robbery_cooldown_seconds),
-                ("老虎机", self._slot_cooldown_seconds),
-            ):
-                if not 0 <= cooldown <= 86400:
-                    raise ValueError(f"{name}冷却时间必须在 0 到 86400 秒之间")
-            if self._slot_prize_units < self._slot_cost_units:
-                raise ValueError("老虎机奖金不能小于单次投入")
+            if not 0 <= self._robbery_cooldown_seconds <= 86400:
+                raise ValueError("打劫冷却时间必须在 0 到 86400 秒之间")
         except ValueError as exc:
             self._game_config_error = str(exc)
 
@@ -666,7 +645,6 @@ class FapiPlugin(Star):
             "/fapi 抢红包 [红包编号]\n"
             "/fapi 红包状态 [红包编号]\n"
             "/fapi 打劫 @用户\n"
-            "/fapi 老虎机\n"
             "/fapi 帮助\n\n"
             f"{red_packet_permission}"
         )
@@ -1173,86 +1151,6 @@ class FapiPlugin(Star):
         settled = await self._settle_game_operation(operation)
         yield event.plain_result(self._game_reply(settled))
 
-    @fapi.command("老虎机", alias={"slot"})
-    async def slot_machine(self, event: AstrMessageEvent):
-        """扣除固定投入并按配置概率派发固定奖金。"""
-        command_context, context_error = self._group_command_context(event)
-        if context_error:
-            yield event.plain_result(context_error)
-            return
-        assert command_context is not None
-        if self._game_config_error:
-            yield event.plain_result("游戏配置不正确，请联系管理员检查插件配置。")
-            return
-        if not self._slot_enabled:
-            yield event.plain_result("老虎机功能当前未开启。")
-            return
-
-        operation_key = self._game_operation_key(
-            event,
-            command_context,
-            "slots",
-        )
-        if operation_key is None:
-            yield event.plain_result("无法确认当前消息编号，为避免重复扣款，本次操作已取消。")
-            return
-
-        early_reply = ""
-        try:
-            async with self._game_command_lock:
-                operation = await self.games.get_by_key(operation_key)
-                if operation is None:
-                    binding = await self.bindings.get_by_qq(
-                        command_context.sender_id
-                    )
-                    if binding is None:
-                        early_reply = (
-                            "当前账号尚未绑定中转站账号，请先使用 /fapi 绑定。"
-                        )
-                    else:
-                        won = roll_success(self._slot_success_rate)
-                        reservation = await self.games.reserve_game(
-                            operation_key=operation_key,
-                            game_type="slots",
-                            group_id=command_context.group_id,
-                            actor_qq_id=command_context.sender_id,
-                            actor_user_id=binding.tokenrouter_user_id,
-                            debit_user_id=binding.tokenrouter_user_id,
-                            credit_user_id=(
-                                binding.tokenrouter_user_id if won else None
-                            ),
-                            debit_units=self._slot_cost_units,
-                            credit_units=self._slot_prize_units if won else 0,
-                            won=won,
-                            cooldown_seconds=self._slot_cooldown_seconds,
-                        )
-                        operation = reservation.operation
-        except GameCooldownActive as exc:
-            yield event.plain_result(
-                f"老虎机冷却中，请在 {exc.retry_after_seconds} 秒后再试。"
-            )
-            return
-        except BindingDatabaseError as exc:
-            logger.error("FAPI 查询老虎机绑定关系失败：%s", exc)
-            yield event.plain_result("远程绑定数据库暂时不可用，请稍后重试。")
-            return
-        except (GameDatabaseError, GameOperationConflict) as exc:
-            logger.error("FAPI 预留老虎机操作失败：%s", exc)
-            yield event.plain_result("游戏数据库暂时不可用，请稍后重试。")
-            return
-
-        if early_reply:
-            yield event.plain_result(early_reply)
-            return
-        settled = await self._settle_game_operation(operation)
-        if self._slot_animation_enabled:
-            try:
-                yield event.plain_result("🎰正在转动... 🔄 🔄 🔄")
-                await asyncio.sleep(self._slot_animation_delay_seconds)
-            except Exception:
-                logger.exception("FAPI slot animation failed")
-        yield event.plain_result(self._game_reply(settled))
-
     async def terminate(self) -> None:
         for attribute, task_name in (
             ("_game_worker_task", "游戏结算"),
@@ -1650,26 +1548,7 @@ class FapiPlugin(Star):
                 )
             return "打劫失败，本次没有余额变动。"
 
-        if operation.status in pending:
-            return "老虎机结果已锁定，余额正在结算，请稍后查询。"
-        if operation.status == GameStatus.MANUAL_REVIEW:
-            return "老虎机结算异常，退款需要管理员人工处理。"
-        if operation.status == GameStatus.INSUFFICIENT:
-            return "余额不足，无法支付本次老虎机投入。"
-        if operation.status == GameStatus.REFUNDED:
-            return "老虎机结算失败，本次投入已经退回账户。"
-        if operation.status == GameStatus.FAILED:
-            return "老虎机结算失败，本次未扣款。"
-        if operation.won:
-            return (
-                "老虎机中奖\n"
-                f"投入：{FapiPlugin._format_units(operation.debit_units)}\n"
-                f"奖金：{FapiPlugin._format_units(operation.credit_units)}"
-            )
-        return (
-            "老虎机未中奖\n"
-            f"本次投入：{FapiPlugin._format_units(operation.debit_units)}"
-        )
+        return "游戏结算状态不可识别。"
 
     @staticmethod
     def _is_robbery_backfire(operation: GameOperation) -> bool:

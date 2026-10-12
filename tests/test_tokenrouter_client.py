@@ -434,7 +434,7 @@ class TokenRouterClientTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 request.read(),
                 b'{"balance":0.1,"operation":"subtract",'
-                b'"notes":"slot stake"}',
+                b'"notes":"game debit"}',
             )
             return httpx.Response(
                 200,
@@ -456,7 +456,7 @@ class TokenRouterClientTest(unittest.IsolatedAsyncioTestCase):
                 amount=Decimal("0.10"),
                 operation="subtract",
                 idempotency_key="game-op:debit",
-                notes="slot stake",
+                notes="game debit",
             )
         finally:
             await client.close()

@@ -353,8 +353,6 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             object(),
             {"allowed_group_id": "987654321"},
         )
-        self.plugin._slot_animation_enabled = False
-        self.plugin._slot_animation_delay_seconds = 0
         await self.plugin.client.close()
 
     async def asyncTearDown(self):
@@ -989,7 +987,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/fapi 签到", replies[0])
         self.assertIn("/fapi 抢红包 [红包编号]", replies[0])
         self.assertIn("/fapi 打劫 @用户", replies[0])
-        self.assertIn("/fapi 老虎机", replies[0])
+        self.assertNotIn("老虎机", replies[0])
+        self.assertFalse(hasattr(self.plugin, "slot_machine"))
         self.assertIn("群主、群管理员或 AstrBot 管理员", replies[0])
 
     async def test_official_help_menu_requires_email_and_astrbot_admin(self):
@@ -1061,7 +1060,6 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             self.plugin.claim_red_packet(event),
             self.plugin.red_packet_status(event),
             self.plugin.robbery(event),
-            self.plugin.slot_machine(event),
         )
 
         for command in commands:
@@ -1097,7 +1095,6 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             self.plugin.claim_red_packet(event),
             self.plugin.red_packet_status(event),
             self.plugin.robbery(event),
-            self.plugin.slot_machine(event),
         )
 
         for command in commands:
@@ -1602,113 +1599,6 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replies, ["打劫冷却中，请在 37 秒后再试。"])
         self.assertEqual(client.calls, [])
 
-    async def test_slot_win_debits_cost_then_credits_prize(self):
-        games = InMemoryGameStore(self.module)
-        client = BalanceClient(self.module)
-        self.plugin.bindings = GameBindings({"12345": 11})
-        self.plugin.games = games
-        self.plugin.client = client
-        self.module.roll_success = lambda _rate: True
-
-        replies = await collect(self.plugin.slot_machine(FakeEvent()))
-
-        self.assertEqual(
-            replies,
-            ["老虎机中奖\n投入：USD 0.10\n奖金：USD 0.20"],
-        )
-        reservation = games.reserve_calls[0]
-        self.assertEqual(reservation["debit_user_id"], 11)
-        self.assertEqual(reservation["credit_user_id"], 11)
-        self.assertEqual(reservation["debit_units"], 10_000_000)
-        self.assertEqual(reservation["credit_units"], 20_000_000)
-        self.assertEqual(
-            [
-                (call["operation"], call["amount"], call["idempotency_key"])
-                for call in client.calls
-            ],
-            [
-                (
-                    "subtract",
-                    Decimal("0.10"),
-                    "fapi-game:v1:game-op-1:debit",
-                ),
-                (
-                    "add",
-                    Decimal("0.20"),
-                    "fapi-game:v1:game-op-1:credit",
-                ),
-            ],
-        )
-
-    async def test_slot_loss_only_debits_cost(self):
-        games = InMemoryGameStore(self.module)
-        client = BalanceClient(self.module)
-        self.plugin.bindings = GameBindings({"12345": 11})
-        self.plugin.games = games
-        self.plugin.client = client
-        self.module.roll_success = lambda _rate: False
-
-        replies = await collect(self.plugin.slot_machine(FakeEvent()))
-
-        self.assertEqual(replies, ["老虎机未中奖\n本次投入：USD 0.10"])
-        self.assertEqual(len(client.calls), 1)
-        self.assertEqual(client.calls[0]["operation"], "subtract")
-        self.assertEqual(client.calls[0]["amount"], Decimal("0.10"))
-        self.assertIsNone(games.reserve_calls[0]["credit_user_id"])
-        self.assertEqual(games.reserve_calls[0]["credit_units"], 0)
-
-    async def test_slot_animation_precedes_result_when_enabled(self):
-        games = InMemoryGameStore(self.module)
-        self.plugin.bindings = GameBindings({"12345": 11})
-        self.plugin.games = games
-        self.plugin.client = BalanceClient(self.module)
-        self.plugin._slot_animation_enabled = True
-        self.module.roll_success = lambda _rate: False
-
-        replies = await collect(self.plugin.slot_machine(FakeEvent()))
-
-        self.assertEqual(replies[0], "🎰正在转动... 🔄 🔄 🔄")
-        self.assertEqual(replies[1], "老虎机未中奖\n本次投入：USD 0.10")
-
-    async def test_slot_skips_animation_when_disabled(self):
-        games = InMemoryGameStore(self.module)
-        self.plugin.bindings = GameBindings({"12345": 11})
-        self.plugin.games = games
-        self.plugin.client = BalanceClient(self.module)
-        self.plugin._slot_animation_enabled = False
-        self.module.roll_success = lambda _rate: False
-
-        replies = await collect(self.plugin.slot_machine(FakeEvent()))
-
-        self.assertEqual(replies, ["老虎机未中奖\n本次投入：USD 0.10"])
-
-    async def test_slot_insufficient_balance_never_pays_prize(self):
-        games = InMemoryGameStore(self.module)
-        client = BalanceClient(self.module, fail_on=1)
-        self.plugin.bindings = GameBindings({"12345": 11})
-        self.plugin.games = games
-        self.plugin.client = client
-        self.module.roll_success = lambda _rate: True
-
-        replies = await collect(self.plugin.slot_machine(FakeEvent()))
-
-        self.assertEqual(replies, ["余额不足，无法支付本次老虎机投入。"])
-        self.assertEqual(len(client.calls), 1)
-        self.assertEqual(client.calls[0]["operation"], "subtract")
-        self.assertIn(("insufficient", "game-op-1"), games.transition_calls)
-
-    async def test_slot_reports_cooldown_without_charging(self):
-        games = InMemoryGameStore(self.module, cooldown_seconds=9)
-        client = BalanceClient(self.module)
-        self.plugin.bindings = GameBindings({"12345": 11})
-        self.plugin.games = games
-        self.plugin.client = client
-
-        replies = await collect(self.plugin.slot_machine(FakeEvent()))
-
-        self.assertEqual(replies, ["老虎机冷却中，请在 9 秒后再试。"])
-        self.assertEqual(client.calls, [])
-
     async def test_game_credit_failure_refunds_original_debit_user(self):
         operation = game_operation(
             self.module,
@@ -1753,7 +1643,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
     async def test_retryable_game_error_keeps_pending_state(self):
         operation = game_operation(
             self.module,
-            game_type="slots",
+            game_type="legacy_game",
             status=self.module.GameStatus.PENDING_DEBIT,
             target_qq_id=None,
             target_user_id=None,

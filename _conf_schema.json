@@ -174,40 +174,6 @@
     "default": 300,
     "slider": {"min": 0, "max": 86400, "step": 1}
   },
-  "slot_enabled": {
-    "description": "启用老虎机",
-    "type": "bool",
-    "default": true
-  },
-  "slot_animation_enabled": {
-    "description": "启用老虎机动画",
-    "type": "bool",
-    "hint": "老虎机完成结算后先发送 emoji 转动提示，再显示最终结果。动画不参与开奖结果计算。",
-    "default": true
-  },
-  "slot_cost": {
-    "description": "老虎机单次投入",
-    "type": "string",
-    "default": "0.10"
-  },
-  "slot_prize": {
-    "description": "老虎机中奖奖金",
-    "type": "string",
-    "hint": "中奖时发放的总奖金；实际净收益为奖金减去单次投入。",
-    "default": "0.20"
-  },
-  "slot_success_rate": {
-    "description": "老虎机中奖率（百分比）",
-    "type": "int",
-    "default": 40,
-    "slider": {"min": 0, "max": 100, "step": 1}
-  },
-  "slot_cooldown_seconds": {
-    "description": "老虎机冷却秒数",
-    "type": "int",
-    "default": 10,
-    "slider": {"min": 0, "max": 86400, "step": 1}
-  },
   "reward_timezone": {
     "description": "奖励日期时区",
     "type": "string",

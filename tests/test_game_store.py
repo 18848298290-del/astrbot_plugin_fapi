@@ -143,7 +143,7 @@ class ReservationValidationTest(unittest.TestCase):
     def test_money_units_must_be_non_negative_integers(self):
         values = {
             "operation_key": "key",
-            "game_type": "slots",
+            "game_type": "robbery",
             "group_id": "group",
             "actor_qq_id": "actor",
             "actor_user_id": 1,
@@ -165,7 +165,7 @@ class ReservationValidationTest(unittest.TestCase):
     def test_credit_requires_recipient(self):
         values = {
             "operation_key": "key",
-            "game_type": "slots",
+            "game_type": "robbery",
             "group_id": "group",
             "actor_qq_id": "actor",
             "actor_user_id": 1,
