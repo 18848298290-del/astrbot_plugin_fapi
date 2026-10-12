@@ -236,6 +236,12 @@
     "type": "string",
     "default": "astrbot_fapi_reward_budgets"
   },
+  "mysql_daily_broadcasts_table": {
+    "description": "每日播报状态表名",
+    "type": "string",
+    "hint": "插件启动时自动创建，用于防止多实例向同一群重复发送每日播报。",
+    "default": "astrbot_fapi_daily_broadcasts"
+  },
   "mysql_game_operations_table": {
     "description": "游戏结算记录表名",
     "type": "string",

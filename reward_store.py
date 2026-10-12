@@ -193,6 +193,7 @@ class MySQLRewardStore:
         packets_table: str = "astrbot_fapi_red_packets",
         claims_table: str = "astrbot_fapi_red_claims",
         budgets_table: str = "astrbot_fapi_reward_budgets",
+        broadcasts_table: str = "astrbot_fapi_daily_broadcasts",
         connect_timeout: int = 10,
         ssl_enabled: bool = True,
         ssl_verify: bool = True,
@@ -207,6 +208,7 @@ class MySQLRewardStore:
         self.packets_table = packets_table.strip()
         self.claims_table = claims_table.strip()
         self.budgets_table = budgets_table.strip()
+        self.broadcasts_table = broadcasts_table.strip()
         self.connect_timeout = max(1, connect_timeout)
         self.ssl_enabled = ssl_enabled
         self.ssl_verify = ssl_verify
@@ -846,6 +848,98 @@ class MySQLRewardStore:
         except Exception as exc:
             raise RewardDatabaseError("记录奖励发放错误失败") from exc
 
+    async def claim_daily_broadcast(
+        self,
+        *,
+        report_date: date,
+        target_umo: str,
+        lease_seconds: int = 600,
+    ) -> str | None:
+        """Claim one daily broadcast across all plugin instances."""
+        await self.initialize()
+        normalized_target = target_umo.strip()
+        if not normalized_target:
+            raise RewardDatabaseError("每日播报目标不能为空")
+        safe_lease = max(60, min(int(lease_seconds), 3600))
+        target_key = hashlib.sha256(normalized_target.encode("utf-8")).hexdigest()
+        lease_token = str(uuid.uuid4())
+        insert_sql = f"""
+            INSERT IGNORE INTO `{self.broadcasts_table}` (
+                report_date, target_key, target_umo, lease_token, lease_expires_at
+            ) VALUES (
+                %s, %s, %s, %s,
+                TIMESTAMPADD(SECOND, %s, UTC_TIMESTAMP(6))
+            )
+        """
+        reclaim_sql = f"""
+            UPDATE `{self.broadcasts_table}`
+            SET target_umo = %s,
+                lease_token = %s,
+                lease_expires_at = TIMESTAMPADD(SECOND, %s, UTC_TIMESTAMP(6)),
+                updated_at = UTC_TIMESTAMP(6)
+            WHERE report_date = %s AND target_key = %s
+              AND sent_at IS NULL
+              AND lease_expires_at <= UTC_TIMESTAMP(6)
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        insert_sql,
+                        (
+                            report_date,
+                            target_key,
+                            normalized_target,
+                            lease_token,
+                            safe_lease,
+                        ),
+                    )
+                    if cursor.rowcount == 1:
+                        return lease_token
+                    await cursor.execute(
+                        reclaim_sql,
+                        (
+                            normalized_target,
+                            lease_token,
+                            safe_lease,
+                            report_date,
+                            target_key,
+                        ),
+                    )
+                    return lease_token if cursor.rowcount == 1 else None
+        except Exception as exc:
+            raise RewardDatabaseError("领取每日播报任务失败") from exc
+
+    async def mark_daily_broadcast_sent(
+        self,
+        *,
+        report_date: date,
+        target_umo: str,
+        lease_token: str,
+    ) -> None:
+        await self.initialize()
+        target_key = hashlib.sha256(target_umo.strip().encode("utf-8")).hexdigest()
+        sql = f"""
+            UPDATE `{self.broadcasts_table}`
+            SET sent_at = UTC_TIMESTAMP(6),
+                lease_token = NULL,
+                lease_expires_at = NULL,
+                updated_at = UTC_TIMESTAMP(6)
+            WHERE report_date = %s AND target_key = %s
+              AND sent_at IS NULL AND lease_token = %s
+              AND lease_expires_at > UTC_TIMESTAMP(6)
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql, (report_date, target_key, lease_token))
+                    if cursor.rowcount != 1:
+                        raise RewardDatabaseError("每日播报租约已失效")
+        except RewardDatabaseError:
+            raise
+        except Exception as exc:
+            raise RewardDatabaseError("确认每日播报完成失败") from exc
+
     async def _create_tables(self) -> None:
         statements = [
             f"""
@@ -935,6 +1029,21 @@ class MySQLRewardStore:
                     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
                         ON UPDATE CURRENT_TIMESTAMP(6),
                     PRIMARY KEY (reward_date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            f"""
+                CREATE TABLE IF NOT EXISTS `{self.broadcasts_table}` (
+                    report_date DATE NOT NULL,
+                    target_key CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                    target_umo VARCHAR(512) NOT NULL,
+                    lease_token CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+                    lease_expires_at DATETIME(6) NULL,
+                    sent_at DATETIME(6) NULL,
+                    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                        ON UPDATE CURRENT_TIMESTAMP(6),
+                    PRIMARY KEY (report_date, target_key),
+                    KEY idx_fapi_broadcast_lease (sent_at, lease_expires_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
         ]
@@ -1205,8 +1314,9 @@ class MySQLRewardStore:
             self.packets_table,
             self.claims_table,
             self.budgets_table,
+            self.broadcasts_table,
         }
-        if len(table_names) != 5:
+        if len(table_names) != 6:
             raise RewardDatabaseError("奖励数据表名称不能重复")
         if not all(_IDENTIFIER_PATTERN.fullmatch(name) for name in table_names):
             raise RewardDatabaseError("奖励数据表名称不合法")

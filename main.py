@@ -98,7 +98,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和打劫",
-    "4.0.0",
+    "4.0.1",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -142,6 +142,12 @@ class FapiPlugin(Star):
                 config.get(
                     "mysql_reward_budgets_table",
                     "astrbot_fapi_reward_budgets",
+                )
+            ).strip(),
+            "mysql_daily_broadcasts_table": str(
+                config.get(
+                    "mysql_daily_broadcasts_table",
+                    "astrbot_fapi_daily_broadcasts",
                 )
             ).strip(),
             "mysql_game_operations_table": str(
@@ -194,6 +200,7 @@ class FapiPlugin(Star):
             packets_table=table_names["mysql_red_packets_table"],
             claims_table=table_names["mysql_red_claims_table"],
             budgets_table=table_names["mysql_reward_budgets_table"],
+            broadcasts_table=table_names["mysql_daily_broadcasts_table"],
         )
         self.games = MySQLGameStore(
             **mysql_options,
@@ -1726,8 +1733,14 @@ class FapiPlugin(Star):
                 logger.exception("FAPI 每日自动播报失败")
 
     async def _send_daily_broadcast(self) -> None:
-        overview = await self.client.get_dashboard_overview()
         report_date, start_utc, end_utc = self._daily_stats_window()
+        lease_token = await self.rewards.claim_daily_broadcast(
+            report_date=report_date,
+            target_umo=self._daily_broadcast_umo,
+        )
+        if lease_token is None:
+            return
+        overview = await self.client.get_dashboard_overview()
         stats = await self.rewards.get_daily_stats(
             reward_date=report_date,
             start_utc=start_utc,
@@ -1739,6 +1752,11 @@ class FapiPlugin(Star):
             self._daily_broadcast_reply(overview, stats)
         )
         await self.context.send_message(self._daily_broadcast_umo, chain)
+        await self.rewards.mark_daily_broadcast_sent(
+            report_date=report_date,
+            target_umo=self._daily_broadcast_umo,
+            lease_token=lease_token,
+        )
 
     def _daily_stats_window(self) -> tuple[date, datetime, datetime]:
         now = datetime.now(self._reward_timezone)
@@ -2164,7 +2182,18 @@ class FapiPlugin(Star):
             GameStatus.MANUAL_REVIEW: "退款待人工处理",
         }
         status = status_labels.get(operation.status, operation.status.value)
-        if operation.status in {
+        if is_credit and operation.status in {
+            GameStatus.PENDING_REFUND,
+            GameStatus.MANUAL_REVIEW,
+        }:
+            amount = self._format_units(0)
+            sign = ""
+            status = (
+                "入账失败，付款方退款中"
+                if operation.status == GameStatus.PENDING_REFUND
+                else "入账失败，付款方退款待人工处理"
+            )
+        elif operation.status in {
             GameStatus.INSUFFICIENT,
             GameStatus.FAILED,
             GameStatus.REFUNDED,

@@ -92,7 +92,7 @@
 - 打劫开关、金额、成功率、冷却，以及反噬开关、失败后反噬率和反噬金额。
 - 解绑后的重新绑定冷却秒数；设为 0 可关闭。
 - 可选的每日播报开关、完整群 UMO 和播报时间。UMO 可在目标群发送 `/sid` 获取，必须与 `allowed_group_id` 指向同一群。
-- 绑定表、绑定冷却表、五张奖励表、游戏结算表及游戏冷却表的表名。九张表名必须互不重复，只能包含字母、数字和下划线，且必须以字母开头。
+- 绑定表、绑定冷却表、五张奖励表、每日播报状态表、游戏结算表及游戏冷却表的表名。十张表名必须互不重复，只能包含字母、数字和下划线，且必须以字母开头。
 
 MySQL 用户至少需要目标数据库的 `CREATE`、`ALTER`、`SELECT`、`INSERT`、`UPDATE` 权限。插件启动时会自动创建：
 
@@ -104,6 +104,7 @@ astrbot_fapi_checkins
 astrbot_fapi_red_packets
 astrbot_fapi_red_claims
 astrbot_fapi_reward_budgets
+astrbot_fapi_daily_broadcasts
 astrbot_fapi_game_operations
 astrbot_fapi_game_cooldowns
 ```

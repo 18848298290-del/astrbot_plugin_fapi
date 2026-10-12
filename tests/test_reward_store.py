@@ -131,6 +131,94 @@ class RewardStoreDatabaseBehaviorTest(unittest.IsolatedAsyncioTestCase):
         )
         store._create_tables.assert_awaited_once_with()
 
+    async def test_daily_broadcast_claim_is_atomic_and_skips_existing_lease(self):
+        class Cursor:
+            def __init__(self, rowcounts):
+                self.rowcounts = iter(rowcounts)
+                self.rowcount = 0
+                self.executions = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def execute(self, sql, params=None):
+                self.executions.append((sql, params))
+                self.rowcount = next(self.rowcounts)
+
+        class Acquire:
+            def __init__(self, connection):
+                self.connection = connection
+
+            async def __aenter__(self):
+                return self.connection
+
+            async def __aexit__(self, *_args):
+                return False
+
+        first_cursor = Cursor([1])
+        second_cursor = Cursor([0, 0])
+        cursors = iter([first_cursor, second_cursor])
+        pool = SimpleNamespace(
+            acquire=lambda: Acquire(
+                SimpleNamespace(cursor=lambda: next(cursors))
+            )
+        )
+        store = self.store()
+        store._pool = pool
+
+        first = await store.claim_daily_broadcast(
+            report_date=date(2026, 10, 12),
+            target_umo="FapiHub:GroupMessage:group-1",
+        )
+        second = await store.claim_daily_broadcast(
+            report_date=date(2026, 10, 12),
+            target_umo="FapiHub:GroupMessage:group-1",
+        )
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        self.assertIn("INSERT IGNORE", first_cursor.executions[0][0])
+        self.assertIn("sent_at IS NULL", second_cursor.executions[1][0])
+
+    async def test_mark_daily_broadcast_sent_requires_live_matching_lease(self):
+        class Cursor:
+            rowcount = 1
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def execute(self, sql, params=None):
+                self.sql = sql
+                self.params = params
+
+        class Acquire:
+            async def __aenter__(self):
+                return connection
+
+            async def __aexit__(self, *_args):
+                return False
+
+        cursor = Cursor()
+        connection = SimpleNamespace(cursor=lambda: cursor)
+        store = self.store()
+        store._pool = SimpleNamespace(acquire=lambda: Acquire())
+
+        await store.mark_daily_broadcast_sent(
+            report_date=date(2026, 10, 12),
+            target_umo="FapiHub:GroupMessage:group-1",
+            lease_token="lease-1",
+        )
+
+        self.assertIn("sent_at = UTC_TIMESTAMP(6)", cursor.sql)
+        self.assertIn("lease_expires_at > UTC_TIMESTAMP(6)", cursor.sql)
+        self.assertEqual(cursor.params[-1], "lease-1")
+
     async def test_pending_previous_checkin_preserves_streak(self):
         class Cursor:
             def __init__(self):

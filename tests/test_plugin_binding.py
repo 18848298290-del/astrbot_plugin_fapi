@@ -890,6 +890,15 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
+    async def test_constructor_includes_daily_broadcast_table_in_uniqueness(self):
+        with self.assertRaisesRegex(ValueError, "mysql_daily_broadcasts_table"):
+            self.module.FapiPlugin(
+                object(),
+                {
+                    "mysql_table": "astrbot_fapi_daily_broadcasts",
+                },
+            )
+
     async def test_game_lease_covers_all_http_timeout_phases(self):
         plugin = self.module.FapiPlugin(
             object(),
@@ -2610,6 +2619,94 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("FAPI 每日播报 2026-10-12", reply)
         self.assertIn("签到：3 人", reply)
         self.assertIn("红包到账：2 份", reply)
+
+    async def test_daily_broadcast_sends_only_after_database_claim(self):
+        sent = []
+
+        class MessageChain:
+            def message(chain_self, text):
+                chain_self.text = text
+                return chain_self
+
+        class Context:
+            async def send_message(_self, umo, chain):
+                sent.append((umo, chain.text))
+
+        class Client:
+            calls = 0
+
+            async def get_dashboard_overview(client_self):
+                client_self.calls += 1
+                return SimpleNamespace(
+                    today_requests=12,
+                    today_tokens=345,
+                    today_actual_cost=Decimal("1.25"),
+                    rpm=2,
+                    tpm=30,
+                    stats_stale=False,
+                )
+
+        class Rewards:
+            claims = 0
+            completed = []
+
+            async def claim_daily_broadcast(rewards_self, **_values):
+                rewards_self.claims += 1
+                return "lease-1" if rewards_self.claims == 1 else None
+
+            async def get_daily_stats(_self, **values):
+                return self.module.DailyRewardStats(
+                    reward_date=values["reward_date"],
+                    checkin_count=3,
+                    checkin_units=15_000_000,
+                    red_packet_count=1,
+                    red_packet_units=100_000_000,
+                    claim_count=2,
+                    claim_units=50_000_000,
+                )
+
+            async def mark_daily_broadcast_sent(rewards_self, **values):
+                rewards_self.completed.append(values)
+
+        event_module = sys.modules["astrbot.api.event"]
+        event_module.MessageChain = MessageChain
+        self.plugin.context = Context()
+        self.plugin.client = Client()
+        self.plugin.rewards = Rewards()
+        self.plugin._daily_broadcast_umo = "FapiHub:GroupMessage:987654321"
+
+        await self.plugin._send_daily_broadcast()
+        await self.plugin._send_daily_broadcast()
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(self.plugin.client.calls, 1)
+        self.assertEqual(len(self.plugin.rewards.completed), 1)
+        self.assertEqual(self.plugin.rewards.completed[0]["lease_token"], "lease-1")
+
+    async def test_refund_ledger_never_shows_unreceived_credit(self):
+        for status, expected_status in (
+            (self.module.GameStatus.PENDING_REFUND, "入账失败，付款方退款中"),
+            (
+                self.module.GameStatus.MANUAL_REVIEW,
+                "入账失败，付款方退款待人工处理",
+            ),
+        ):
+            with self.subTest(status=status):
+                operation = game_operation(
+                    self.module,
+                    status=status,
+                    debit_user_id=22,
+                    credit_user_id=11,
+                    debit_units=10_000_000,
+                    credit_units=10_000_000,
+                )
+
+                receiver_line = self.plugin._game_ledger_line(operation, 11)
+                payer_line = self.plugin._game_ledger_line(operation, 22)
+
+                self.assertIn(f"收入 USD 0.00（{expected_status}）", receiver_line)
+                self.assertNotIn("收入 +USD 0.10", receiver_line)
+                self.assertIn("支出 -USD 0.10", payer_line)
 
 
 async def _async_value(value):
