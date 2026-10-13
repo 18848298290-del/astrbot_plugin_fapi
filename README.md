@@ -11,10 +11,10 @@
 /fapi 绑定
 /fapi 绑定 <完整邮箱>
 /fapi 绑定状态
-/fapi 解绑 [确认]
 /fapi 余额
 /fapi 签到
 /fapi 签到排行
+/fapi 邀请排行
 /fapi 红包 <总金额> <份数>
 /fapi 抢红包 [红包编号]
 /fapi 红包状态 [红包编号]
@@ -65,7 +65,8 @@
 - 绑定只按唯一邮箱精确查询，用户名不参与身份识别；内部仍保存 TokenRouter 用户 ID 作为稳定关联键。
 - 一个 QQ 只能绑定一个 TokenRouter 用户，一个 TokenRouter 用户也只能绑定一个 QQ。
 - 邮箱不存在或查询结果不唯一时不会写入绑定。
-- `/fapi 解绑` 需要在 60 秒内再次发送 `/fapi 解绑 确认`。解绑后的重新绑定冷却默认 1 小时，并持久化到 MySQL。
+- 绑定建立后不能由 QQ 用户自行解除；如需迁移或纠正绑定，请联系管理员处理。
+- QQ 官方机器人收到可靠的群成员邀请事件后，会在群内提示“邀请人邀请了新成员”，并记录邀请关系；新成员连续留存 24 小时才计入有效邀请，邀请人需要在结算时已完成绑定。默认每 5 名有效邀请奖励 `USD 0.50`，可使用 `/fapi 邀请排行` 查看当前群排行。
 
 主动填写邮箱的绑定命令会出现在群消息中。余额查询仅回显脱敏邮箱；仍应确保指定群是受控群，并按需清理包含完整邮箱的绑定消息。
 
@@ -90,21 +91,23 @@
 - 远程 MySQL 地址、端口、用户名、密码、数据库和 TLS 设置。
 - 签到奖励最小值与最大值、签到每日预算、红包上限、红包每日预算、份数、有效期和奖励时区。
 - 打劫开关、金额、成功率、冷却，以及反噬开关、失败后反噬率和反噬金额。
-- 解绑后的重新绑定冷却秒数；设为 0 可关闭。
 - 可选的每日播报开关、完整群 UMO 和播报时间。UMO 可在目标群发送 `/sid` 获取，必须与 `allowed_group_id` 指向同一群。
-- 绑定表、绑定冷却表、五张奖励表、每日播报状态表、游戏结算表及游戏冷却表的表名。十张表名必须互不重复，只能包含字母、数字和下划线，且必须以字母开头。
+- 邀请奖励人数门槛、奖励金额和有效留存小时数；默认每 5 人奖励 `USD 0.50`，留存 24 小时。
+- 绑定表、历史绑定冷却表、六张奖励及邀请表、每日播报状态表、游戏结算表及游戏冷却表的表名。十二张表名必须互不重复，只能包含字母、数字和下划线，且必须以字母开头。
 
 MySQL 用户至少需要目标数据库的 `CREATE`、`ALTER`、`SELECT`、`INSERT`、`UPDATE` 权限。插件启动时会自动创建：
 
 ```text
 astrbot_fapi_bindings
-astrbot_fapi_binding_cooldowns
+astrbot_fapi_binding_cooldowns（兼容历史冷却记录）
 astrbot_fapi_reward_jobs
 astrbot_fapi_checkins
 astrbot_fapi_red_packets
 astrbot_fapi_red_claims
 astrbot_fapi_reward_budgets
 astrbot_fapi_daily_broadcasts
+astrbot_fapi_invitations
+astrbot_fapi_invitation_stats
 astrbot_fapi_game_operations
 astrbot_fapi_game_cooldowns
 ```

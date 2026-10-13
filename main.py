@@ -42,6 +42,7 @@ from .reward_store import (
     RewardDatabaseError,
     RewardJob,
     RewardJobStatus,
+    InvitationEvent,
     money_to_units,
     units_to_decimal,
 )
@@ -57,6 +58,22 @@ from .tokenrouter_client import (
 
 
 _SUPPORTED_QQ_PLATFORMS = frozenset({"aiocqhttp", "qq_official"})
+_EVENT_ALL = getattr(getattr(filter, "EventMessageType", None), "ALL", None)
+_QQ_OFFICIAL = getattr(getattr(filter, "PlatformAdapterType", None), "QQOFFICIAL", None)
+
+
+def _optional_event_filter(factory, value):
+    if factory is None or value is None:
+        return lambda function: function
+    return factory(value)
+
+
+_event_message_type = _optional_event_filter(
+    getattr(filter, "event_message_type", None), _EVENT_ALL
+)
+_platform_adapter_type = _optional_event_filter(
+    getattr(filter, "platform_adapter_type", None), _QQ_OFFICIAL
+)
 _GAME_REFUND_MAX_ATTEMPTS = 5
 _REPLY_MARKUP_TRANSLATION = str.maketrans(
     {
@@ -98,7 +115,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和打劫",
-    "4.0.1",
+    "4.1.1",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -162,6 +179,15 @@ class FapiPlugin(Star):
                     "astrbot_fapi_game_cooldowns",
                 )
             ).strip(),
+            "mysql_invitations_table": str(
+                config.get("mysql_invitations_table", "astrbot_fapi_invitations")
+            ).strip(),
+            "mysql_invitation_stats_table": str(
+                config.get(
+                    "mysql_invitation_stats_table",
+                    "astrbot_fapi_invitation_stats",
+                )
+            ).strip(),
         }
         self._validate_unique_table_names(table_names)
         request_timeout = float(config.get("request_timeout", 10))
@@ -201,6 +227,8 @@ class FapiPlugin(Star):
             claims_table=table_names["mysql_red_claims_table"],
             budgets_table=table_names["mysql_reward_budgets_table"],
             broadcasts_table=table_names["mysql_daily_broadcasts_table"],
+            invitations_table=table_names["mysql_invitations_table"],
+            invitation_stats_table=table_names["mysql_invitation_stats_table"],
         )
         self.games = MySQLGameStore(
             **mysql_options,
@@ -213,11 +241,13 @@ class FapiPlugin(Star):
         self._game_delivery_lock = asyncio.Lock()
         self._game_worker_task: asyncio.Task | None = None
         self._daily_broadcast_task: asyncio.Task | None = None
-        self._unbind_confirmations: dict[tuple[str, str], tuple[int, float]] = {}
-        self._unbind_confirmation_seconds = 60
-        self._unbind_cooldown_seconds = max(
-            0,
-            min(int(config.get("unbind_cooldown_seconds", 3600)), 2_592_000),
+        self._invitation_task: asyncio.Task | None = None
+        self._invitation_threshold = max(1, int(config.get("invitation_threshold", 5)))
+        self._invitation_reward_units = money_to_units(
+            config.get("invitation_reward", "0.50")
+        )
+        self._invitation_maturity_hours = max(
+            0, min(int(config.get("invitation_maturity_hours", 24)), 720)
         )
         self._daily_broadcast_enabled = bool(
             config.get("daily_broadcast_enabled", False)
@@ -753,10 +783,10 @@ class FapiPlugin(Star):
             "FAPI 功能菜单\n"
             f"{binding_usage}\n"
             "/fapi 绑定状态\n"
-            "/fapi 解绑 [确认]\n"
             "/fapi 余额\n"
             "/fapi 签到\n"
             "/fapi 签到排行\n"
+            "/fapi 邀请排行\n"
             "/fapi 红包 <总金额> <份数>\n"
             "/fapi 抢红包 [红包编号]\n"
             "/fapi 红包状态 [红包编号]\n"
@@ -837,7 +867,7 @@ class FapiPlugin(Star):
             )
         except BindCooldownActive as exc:
             yield event.plain_result(
-                "解绑冷却中，请在 "
+                "绑定冷却中，请在 "
                 f"{self._format_duration(exc.retry_after_seconds)} 后再绑定。"
             )
             return
@@ -886,68 +916,6 @@ class FapiPlugin(Star):
             return
         yield event.plain_result("当前账号已绑定中转站账号。")
 
-    @fapi.command("解绑", alias={"unbind"})
-    async def unbind(self, event: AstrMessageEvent, confirmation: str = ""):
-        """二次确认后解除绑定，并启用持久化重绑冷却。"""
-        command_context, context_error = self._group_command_context(event)
-        if context_error:
-            yield event.plain_result(context_error)
-            return
-        assert command_context is not None
-        key = (command_context.platform, command_context.sender_id)
-        now = asyncio.get_running_loop().time()
-        stale_keys = [
-            pending_key
-            for pending_key, (_user_id, expires_at) in self._unbind_confirmations.items()
-            if expires_at < now
-        ]
-        for stale_key in stale_keys:
-            self._unbind_confirmations.pop(stale_key, None)
-
-        if confirmation.strip().casefold() not in {"确认", "confirm"}:
-            try:
-                binding = await self.bindings.get_by_qq(command_context.sender_id)
-            except BindingDatabaseError as exc:
-                logger.error("FAPI 查询解绑绑定关系失败：%s", exc)
-                yield event.plain_result("远程绑定数据库暂时不可用，请稍后重试。")
-                return
-            if binding is None:
-                self._unbind_confirmations.pop(key, None)
-                yield event.plain_result("当前账号尚未绑定中转站账号。")
-                return
-            self._unbind_confirmations[key] = (
-                binding.tokenrouter_user_id,
-                now + self._unbind_confirmation_seconds,
-            )
-            yield event.plain_result(
-                "解绑后需等待 "
-                f"{self._format_duration(self._unbind_cooldown_seconds)} 才能重新绑定。\n"
-                "如确认解绑，请在 60 秒内发送：/fapi 解绑 确认"
-            )
-            return
-
-        pending = self._unbind_confirmations.pop(key, None)
-        if pending is None or pending[1] < now:
-            yield event.plain_result("解绑确认已过期，请先重新发送 /fapi 解绑。")
-            return
-        try:
-            removed = await self.bindings.unbind(
-                qq_id=command_context.sender_id,
-                expected_user_id=pending[0],
-                cooldown_seconds=self._unbind_cooldown_seconds,
-            )
-        except BindingDatabaseError as exc:
-            logger.error("FAPI 解除绑定失败：%s", exc)
-            yield event.plain_result("远程绑定数据库暂时不可用，请稍后重试。")
-            return
-        if not removed:
-            yield event.plain_result("绑定状态已经变化，本次解绑已取消，请重新确认。")
-            return
-        yield event.plain_result(
-            "解绑成功。重新绑定冷却："
-            f"{self._format_duration(self._unbind_cooldown_seconds)}。"
-        )
-
     @fapi.command("签到排行", alias={"checkin_rank"})
     async def checkin_ranking(self, event: AstrMessageEvent):
         """显示累计签到次数排行。"""
@@ -965,6 +933,36 @@ class FapiPlugin(Star):
             yield event.plain_result("排行数据库暂时不可用，请稍后重试。")
             return
         yield event.plain_result(reply)
+
+    @fapi.command("邀请排行", alias={"invite_rank", "邀请排行榜"})
+    async def invitation_ranking(self, event: AstrMessageEvent):
+        """显示当前群有效邀请人数排行。"""
+        command_context, context_error = self._group_command_context(event)
+        if context_error:
+            yield event.plain_result(context_error)
+            return
+        assert command_context is not None
+        try:
+            entries = await self.rewards.get_invitation_ranking(
+                group_id=command_context.group_id,
+                limit=10,
+            )
+        except RewardDatabaseError as exc:
+            logger.error("FAPI 查询邀请排行失败：%s", exc)
+            yield event.plain_result("邀请排行暂时不可用，请稍后重试。")
+            return
+        if not entries:
+            yield event.plain_result("当前群还没有有效邀请记录。")
+            return
+        lines = ["邀请排行榜（有效留存人数）"]
+        for index, (inviter_id, valid_count, rewarded_count) in enumerate(
+            entries, 1
+        ):
+            display_id = inviter_id if len(inviter_id) <= 8 else f"…{inviter_id[-6:]}"
+            lines.append(
+                f"{index}. {display_id}：{valid_count} 人，已获得 {rewarded_count} 次奖励"
+            )
+        yield event.plain_result("\n".join(lines))
 
     @fapi.command("红包排行", alias={"redpacket_rank"})
     async def red_packet_ranking(self, event: AstrMessageEvent):
@@ -1404,6 +1402,7 @@ class FapiPlugin(Star):
     async def terminate(self) -> None:
         for attribute, task_name in (
             ("_daily_broadcast_task", "每日播报"),
+            ("_invitation_task", "邀请奖励"),
             ("_game_worker_task", "游戏结算"),
             ("_reward_worker_task", "奖励补发"),
         ):
@@ -1505,6 +1504,126 @@ class FapiPlugin(Star):
             except Exception:
                 logger.exception("FAPI 奖励补发任务执行失败")
             await asyncio.sleep(15)
+
+    @_event_message_type
+    @_platform_adapter_type
+    async def on_qq_official_event(self, event: AstrMessageEvent):
+        """接收 QQ 官方适配器透传的群成员事件。"""
+        payload = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if payload is None:
+            payload = getattr(event, "raw_message", None)
+        if not isinstance(payload, dict):
+            return
+        data = payload.get("d") if isinstance(payload.get("d"), dict) else payload
+        event_type = str(
+            payload.get("event_type")
+            or payload.get("t")
+            or data.get("event_type")
+            or data.get("type")
+            or ""
+        ).upper()
+        if event_type not in {
+            "GROUP_MEMBER_ADD",
+            "GROUP_MEMBER_INCREASE",
+            "GROUP_MEMBER_REMOVE",
+            "GROUP_MEMBER_DECREASE",
+        }:
+            return
+        group_id = str(data.get("group_openid") or data.get("group_id") or "").strip()
+        invitee_id = str(
+            data.get("member_openid")
+            or data.get("member_id")
+            or data.get("user_openid")
+            or ""
+        ).strip()
+        inviter_id = str(
+            data.get("op_member_openid")
+            or data.get("inviter_openid")
+            or data.get("operator_openid")
+            or ""
+        ).strip()
+        if not group_id or not invitee_id:
+            return
+        if not self._allowed_group_id or group_id != self._allowed_group_id:
+            return
+        if event_type in {"GROUP_MEMBER_REMOVE", "GROUP_MEMBER_DECREASE"}:
+            try:
+                await self.rewards.invalidate_invitation_event(
+                    group_id=group_id,
+                    invitee_qq_id=invitee_id,
+                )
+            except RewardDatabaseError as exc:
+                logger.error("FAPI 标记群成员离开失败：%s", exc)
+            return
+        if not inviter_id or inviter_id == invitee_id:
+            logger.warning(
+                "FAPI 群成员加入事件缺少可靠邀请人字段：group=%s member=%s",
+                group_id,
+                invitee_id,
+            )
+            return
+        event_id = str(
+            payload.get("id")
+            or payload.get("event_id")
+            or data.get("id")
+            or data.get("event_id")
+            or ""
+        ).strip()
+        event_key = event_id or hashlib.sha256(
+            f"{group_id}:{invitee_id}".encode("utf-8")
+        ).hexdigest()
+        try:
+            created = await self.rewards.record_invitation_event(
+                event_key=event_key,
+                group_id=group_id,
+                inviter_qq_id=inviter_id,
+                invitee_qq_id=invitee_id,
+            )
+            if created:
+                inviter_name = str(
+                    data.get("op_member_name")
+                    or data.get("inviter_name")
+                    or inviter_id[-6:]
+                ).strip()
+                invitee_name = str(
+                    data.get("member_name")
+                    or data.get("member_nick")
+                    or invitee_id[-6:]
+                ).strip()
+                yield event.plain_result(
+                    f"邀请提示：{inviter_name} 邀请了 {invitee_name} 加入本群；"
+                    f"连续留存 {self._invitation_maturity_hours} 小时后计入有效邀请。"
+                )
+        except RewardDatabaseError as exc:
+            logger.error("FAPI 记录群邀请事件失败：%s", exc)
+
+    async def _invitation_worker_loop(self) -> None:
+        while True:
+            try:
+                if not hasattr(self.rewards, "list_mature_invitation_events"):
+                    await asyncio.sleep(60)
+                    continue
+                events = await self.rewards.list_mature_invitation_events(
+                    maturity_hours=self._invitation_maturity_hours,
+                    limit=50,
+                )
+                for invitation in events:
+                    binding = await self.bindings.get_by_qq(invitation.inviter_qq_id)
+                    if binding is None:
+                        continue
+                    settlement = await self.rewards.settle_invitation_event(
+                        event=invitation,
+                        tokenrouter_user_id=binding.tokenrouter_user_id,
+                        threshold=self._invitation_threshold,
+                        reward_units=self._invitation_reward_units,
+                    )
+                    if settlement and settlement.reward_job:
+                        await self._deliver_reward(settlement.reward_job)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("FAPI 邀请奖励结算失败")
+            await asyncio.sleep(60)
 
     async def _settle_game_operation(
         self,
@@ -1796,6 +1915,11 @@ class FapiPlugin(Star):
             self._game_worker_task = asyncio.create_task(
                 self._game_worker_loop(),
                 name="fapi-game-worker",
+            )
+        if self._invitation_task is None or self._invitation_task.done():
+            self._invitation_task = asyncio.create_task(
+                self._invitation_worker_loop(),
+                name="fapi-invitation-worker",
             )
         if (
             self._daily_broadcast_enabled

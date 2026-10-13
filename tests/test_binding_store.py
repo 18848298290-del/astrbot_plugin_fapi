@@ -216,40 +216,5 @@ class BindingCooldownTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("TIMESTAMPDIFF(MICROSECOND", cooldown_sql)
         self.assertFalse(any("INSERT INTO `astrbot_fapi_bindings`" in sql for sql, _ in cursor.executions))
 
-    async def test_unbind_deletes_expected_binding_and_persists_cooldown(self):
-        class Cursor:
-            rowcount = 1
-
-            def __init__(self):
-                self.executions = []
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_args):
-                return False
-
-            async def execute(self, sql, params=None):
-                self.executions.append((sql, params))
-
-            async def fetchone(self):
-                return {"tokenrouter_user_id": 7}
-
-        cursor = Cursor()
-        store, connection = self.store(cursor)
-
-        removed = await store.unbind(
-            qq_id="member-openid",
-            expected_user_id=7,
-            cooldown_seconds=3600,
-        )
-
-        self.assertTrue(removed)
-        self.assertEqual(connection.commits, 1)
-        self.assertIn("DELETE FROM", cursor.executions[1][0])
-        self.assertIn(store.cooldown_table, cursor.executions[2][0])
-        self.assertEqual(cursor.executions[2][1], ("member-openid", 3600))
-
-
 if __name__ == "__main__":
     unittest.main()

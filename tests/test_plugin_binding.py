@@ -992,6 +992,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("FAPI 功能菜单", replies[0])
         self.assertIn("/fapi 绑定\n", replies[0])
         self.assertIn("/fapi 绑定 <完整邮箱>", replies[0])
+        self.assertNotIn("/fapi 解绑", replies[0])
         self.assertIn("/fapi 余额", replies[0])
         self.assertIn("/fapi 签到", replies[0])
         self.assertIn("/fapi 抢红包 [红包编号]", replies[0])
@@ -1016,6 +1017,78 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/fapi 绑定 <完整邮箱>", replies[0])
         self.assertNotIn("/fapi 绑定\n", replies[0])
         self.assertIn("红包创建：仅 AstrBot 管理员", replies[0])
+
+    async def test_invitation_event_fails_closed_without_allowed_group(self):
+        class Rewards:
+            async def record_invitation_event(_self, **_values):
+                raise AssertionError("未配置指定群时不得记录邀请")
+
+        self.plugin._allowed_group_id = ""
+        self.plugin.rewards = Rewards()
+        replies = await collect(
+            self.plugin.on_qq_official_event(
+                FakeEvent(
+                    platform_name="qq_official",
+                    raw_message={
+                        "t": "GROUP_MEMBER_ADD",
+                        "d": {
+                            "group_openid": "group-1",
+                            "member_openid": "member-2",
+                            "op_member_openid": "member-1",
+                        },
+                    },
+                )
+            )
+        )
+        self.assertEqual(replies, [])
+
+    async def test_invitation_event_announces_new_member_and_leave_invalidates(self):
+        calls = []
+
+        class Rewards:
+            async def record_invitation_event(_self, **values):
+                calls.append(("add", values))
+                return True
+
+            async def invalidate_invitation_event(_self, **values):
+                calls.append(("remove", values))
+                return True
+
+        self.plugin.rewards = Rewards()
+        add_replies = await collect(
+            self.plugin.on_qq_official_event(
+                FakeEvent(
+                    platform_name="qq_official",
+                    raw_message={
+                        "t": "GROUP_MEMBER_ADD",
+                        "d": {
+                            "group_openid": "987654321",
+                            "member_openid": "member-2",
+                            "member_name": "李四",
+                            "op_member_openid": "member-1",
+                            "op_member_name": "张三",
+                        },
+                    },
+                )
+            )
+        )
+        await collect(
+            self.plugin.on_qq_official_event(
+                FakeEvent(
+                    platform_name="qq_official",
+                    raw_message={
+                        "t": "GROUP_MEMBER_REMOVE",
+                        "d": {
+                            "group_openid": "987654321",
+                            "member_openid": "member-2",
+                        },
+                    },
+                )
+            )
+        )
+        self.assertIn("张三 邀请了 李四", add_replies[0])
+        self.assertEqual(calls[0][0], "add")
+        self.assertEqual(calls[1][0], "remove")
 
     async def test_help_menu_is_rejected_outside_configured_group(self):
         replies = await collect(
@@ -2446,37 +2519,6 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replies, ["红包编号不正确。"])
 
 
-    async def test_unbind_requires_confirmation_and_sets_persistent_cooldown(self):
-        calls = []
-
-        class Store:
-            async def get_by_qq(_self, qq_id):
-                self.assertEqual(qq_id, "12345")
-                return SimpleNamespace(tokenrouter_user_id=73)
-
-            async def unbind(_self, **values):
-                calls.append(values)
-                return True
-
-        self.plugin.bindings = Store()
-        first = await collect(self.plugin.unbind(FakeEvent()))
-        second = await collect(self.plugin.unbind(FakeEvent(), "确认"))
-
-        self.assertIn("60 秒内", first[0])
-        self.assertEqual(second, ["解绑成功。重新绑定冷却：1 小时。"])
-        self.assertEqual(calls[0]["expected_user_id"], 73)
-        self.assertEqual(calls[0]["cooldown_seconds"], 3600)
-
-    async def test_unbind_confirmation_expires_closed(self):
-        class Store:
-            async def unbind(_self, **_values):
-                raise AssertionError("没有预确认时不得删除绑定")
-
-        self.plugin.bindings = Store()
-        replies = await collect(self.plugin.unbind(FakeEvent(), "确认"))
-
-        self.assertIn("确认已过期", replies[0])
-
     async def test_bind_reports_persistent_cooldown(self):
         class Client:
             async def find_users_by_exact_email(_self, _email):
@@ -2490,7 +2532,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.plugin.bindings = Store()
         replies = await collect(self.plugin.bind(FakeEvent(), "alice@example.com"))
 
-        self.assertEqual(replies, ["解绑冷却中，请在 1 分钟 30 秒 后再绑定。"])
+        self.assertEqual(replies, ["绑定冷却中，请在 1 分钟 30 秒 后再绑定。"])
 
     async def test_reward_ranking_masks_email_and_uses_settled_rows(self):
         class Rewards:

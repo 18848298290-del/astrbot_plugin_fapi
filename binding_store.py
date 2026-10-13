@@ -208,55 +208,6 @@ class MySQLBindingStore:
         records = (_row_to_binding(row) for row in rows)
         return {record.tokenrouter_user_id: record for record in records}
 
-    async def unbind(
-        self,
-        *,
-        qq_id: str,
-        expected_user_id: int,
-        cooldown_seconds: int,
-    ) -> bool:
-        await self.initialize()
-        safe_cooldown = max(0, min(int(cooldown_seconds), 2_592_000))
-        try:
-            async with self._pool.acquire() as connection:
-                await connection.begin()
-                try:
-                    async with connection.cursor() as cursor:
-                        await cursor.execute(
-                            f"SELECT tokenrouter_user_id FROM `{self.table}` "
-                            "WHERE qq_id = %s FOR UPDATE",
-                            (qq_id,),
-                        )
-                        row = await cursor.fetchone()
-                        if row is None or int(row["tokenrouter_user_id"]) != int(
-                            expected_user_id
-                        ):
-                            await connection.rollback()
-                            return False
-                        await cursor.execute(
-                            f"DELETE FROM `{self.table}` WHERE qq_id = %s "
-                            "AND tokenrouter_user_id = %s",
-                            (qq_id, expected_user_id),
-                        )
-                        if cursor.rowcount != 1:
-                            await connection.rollback()
-                            return False
-                        if safe_cooldown > 0:
-                            await cursor.execute(
-                                f"INSERT INTO `{self.cooldown_table}` "
-                                "(qq_id, next_bind_at) VALUES (%s, "
-                                "TIMESTAMPADD(SECOND, %s, UTC_TIMESTAMP(6))) "
-                                "ON DUPLICATE KEY UPDATE next_bind_at = VALUES(next_bind_at)",
-                                (qq_id, safe_cooldown),
-                            )
-                    await connection.commit()
-                    return True
-                except Exception:
-                    await connection.rollback()
-                    raise
-        except Exception as exc:
-            raise BindingDatabaseError("解除绑定失败") from exc
-
     async def _bind_once(
         self,
         *,
