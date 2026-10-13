@@ -74,6 +74,13 @@ _event_message_type = _optional_event_filter(
 _platform_adapter_type = _optional_event_filter(
     getattr(filter, "platform_adapter_type", None), _QQ_OFFICIAL
 )
+_on_platform_loaded = getattr(filter, "on_platform_loaded", None)
+
+
+def _optional_hook(factory):
+    if factory is None:
+        return lambda function: function
+    return factory()
 _GAME_REFUND_MAX_ATTEMPTS = 5
 _REPLY_MARKUP_TRANSLATION = str.maketrans(
     {
@@ -115,7 +122,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和打劫",
-    "4.1.1",
+    "4.1.2",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -242,6 +249,7 @@ class FapiPlugin(Star):
         self._game_worker_task: asyncio.Task | None = None
         self._daily_broadcast_task: asyncio.Task | None = None
         self._invitation_task: asyncio.Task | None = None
+        self._qq_member_clients: set[int] = set()
         self._invitation_threshold = max(1, int(config.get("invitation_threshold", 5)))
         self._invitation_reward_units = money_to_units(
             config.get("invitation_reward", "0.50")
@@ -1505,97 +1513,90 @@ class FapiPlugin(Star):
                 logger.exception("FAPI 奖励补发任务执行失败")
             await asyncio.sleep(15)
 
+    async def _record_qq_invitation(self, payload: dict) -> str | None:
+        data = payload.get("d") if isinstance(payload.get("d"), dict) else payload
+        event_type = str(payload.get("event_type") or payload.get("t") or data.get("event_type") or data.get("type") or "").upper()
+        if event_type not in {"GROUP_MEMBER_ADD", "GROUP_MEMBER_INCREASE", "GROUP_MEMBER_REMOVE", "GROUP_MEMBER_DECREASE"}:
+            return None
+        group_id = str(data.get("group_openid") or data.get("group_id") or "").strip()
+        invitee_id = str(data.get("member_openid") or data.get("member_id") or data.get("user_openid") or "").strip()
+        inviter_id = str(data.get("op_member_openid") or data.get("inviter_openid") or data.get("operator_openid") or "").strip()
+        if not group_id or not invitee_id or not self._allowed_group_id or group_id != self._allowed_group_id:
+            return None
+        if event_type in {"GROUP_MEMBER_REMOVE", "GROUP_MEMBER_DECREASE"}:
+            with contextlib.suppress(RewardDatabaseError):
+                await self.rewards.invalidate_invitation_event(group_id=group_id, invitee_qq_id=invitee_id)
+            return None
+        if not inviter_id or inviter_id == invitee_id:
+            logger.warning("FAPI group member event missing inviter: group=%s member=%s", group_id, invitee_id)
+            return None
+        event_id = str(payload.get("id") or payload.get("event_id") or data.get("id") or data.get("event_id") or "").strip()
+        event_key = event_id or hashlib.sha256(f"{group_id}:{invitee_id}".encode("utf-8")).hexdigest()
+        try:
+            created = await self.rewards.record_invitation_event(event_key=event_key, group_id=group_id, inviter_qq_id=inviter_id, invitee_qq_id=invitee_id)
+            if not created:
+                return None
+            inviter_name = str(data.get("op_member_name") or data.get("inviter_name") or inviter_id[-6:]).strip()
+            invitee_name = str(data.get("member_name") or data.get("member_nick") or data.get("username") or invitee_id[-6:]).strip()
+            return f"邀请提示：{inviter_name} 邀请了 {invitee_name} 加入本群！连续留存 {self._invitation_maturity_hours} 小时后计入有效邀请。"
+        except RewardDatabaseError as exc:
+            logger.error("FAPI invitation event recording failed: %s", exc)
+            return None
+
     @_event_message_type
     @_platform_adapter_type
     async def on_qq_official_event(self, event: AstrMessageEvent):
-        """接收 QQ 官方适配器透传的群成员事件。"""
-        payload = getattr(getattr(event, "message_obj", None), "raw_message", None)
-        if payload is None:
-            payload = getattr(event, "raw_message", None)
+        payload = getattr(getattr(event, "message_obj", None), "raw_message", None) or getattr(event, "raw_message", None)
         if not isinstance(payload, dict):
             return
-        data = payload.get("d") if isinstance(payload.get("d"), dict) else payload
-        event_type = str(
-            payload.get("event_type")
-            or payload.get("t")
-            or data.get("event_type")
-            or data.get("type")
-            or ""
-        ).upper()
-        if event_type not in {
-            "GROUP_MEMBER_ADD",
-            "GROUP_MEMBER_INCREASE",
-            "GROUP_MEMBER_REMOVE",
-            "GROUP_MEMBER_DECREASE",
-        }:
-            return
-        group_id = str(data.get("group_openid") or data.get("group_id") or "").strip()
-        invitee_id = str(
-            data.get("member_openid")
-            or data.get("member_id")
-            or data.get("user_openid")
-            or ""
-        ).strip()
-        inviter_id = str(
-            data.get("op_member_openid")
-            or data.get("inviter_openid")
-            or data.get("operator_openid")
-            or ""
-        ).strip()
-        if not group_id or not invitee_id:
-            return
-        if not self._allowed_group_id or group_id != self._allowed_group_id:
-            return
-        if event_type in {"GROUP_MEMBER_REMOVE", "GROUP_MEMBER_DECREASE"}:
+        notice = await self._record_qq_invitation(payload)
+        if notice:
+            yield event.plain_result(notice)
+
+    @_optional_hook(_on_platform_loaded)
+    async def on_platform_loaded(self):
+        manager = getattr(self.context, "platform_manager", None)
+        for platform in (manager.get_insts() if manager else ()):
             try:
-                await self.rewards.invalidate_invitation_event(
-                    group_id=group_id,
-                    invitee_qq_id=invitee_id,
-                )
-            except RewardDatabaseError as exc:
-                logger.error("FAPI 标记群成员离开失败：%s", exc)
-            return
-        if not inviter_id or inviter_id == invitee_id:
-            logger.warning(
-                "FAPI 群成员加入事件缺少可靠邀请人字段：group=%s member=%s",
-                group_id,
-                invitee_id,
-            )
-            return
-        event_id = str(
-            payload.get("id")
-            or payload.get("event_id")
-            or data.get("id")
-            or data.get("event_id")
-            or ""
-        ).strip()
-        event_key = event_id or hashlib.sha256(
-            f"{group_id}:{invitee_id}".encode("utf-8")
-        ).hexdigest()
-        try:
-            created = await self.rewards.record_invitation_event(
-                event_key=event_key,
-                group_id=group_id,
-                inviter_qq_id=inviter_id,
-                invitee_qq_id=invitee_id,
-            )
-            if created:
-                inviter_name = str(
-                    data.get("op_member_name")
-                    or data.get("inviter_name")
-                    or inviter_id[-6:]
-                ).strip()
-                invitee_name = str(
-                    data.get("member_name")
-                    or data.get("member_nick")
-                    or invitee_id[-6:]
-                ).strip()
-                yield event.plain_result(
-                    f"邀请提示：{inviter_name} 邀请了 {invitee_name} 加入本群；"
-                    f"连续留存 {self._invitation_maturity_hours} 小时后计入有效邀请。"
-                )
-        except RewardDatabaseError as exc:
-            logger.error("FAPI 记录群邀请事件失败：%s", exc)
+                if platform.meta().name != "qq_official":
+                    continue
+                client = getattr(platform, "client", None)
+                intents = getattr(platform, "intents", None)
+                if client is None or intents is None or not hasattr(intents, "group_member_event"):
+                    logger.warning("FAPI QQ official adapter has no group_member_event intent")
+                    continue
+                intents.group_member_event = True
+                if id(client) in self._qq_member_clients:
+                    continue
+                self._qq_member_clients.add(id(client))
+
+                async def handle_member(member, *, _platform=platform):
+                    payload = {"event_type": "GROUP_MEMBER_ADD"}
+                    for name in ("group_openid", "member_openid", "op_member_openid", "username", "id", "event_id"):
+                        value = getattr(member, name, None)
+                        if value is not None:
+                            payload[name] = value
+                    notice = await self._record_qq_invitation(payload)
+                    if notice:
+                        from astrbot.api.event import MessageChain
+                        group_id = str(payload.get("group_openid", "")).strip()
+                        platform_id = str(_platform.meta().id).strip()
+                        if group_id and platform_id:
+                            await self.context.send_message(f"{platform_id}:GroupMessage:{group_id}", MessageChain().message(notice))
+
+                async def handle_member_remove(member):
+                    payload = {"event_type": "GROUP_MEMBER_REMOVE"}
+                    for name in ("group_openid", "member_openid", "op_member_openid", "id"):
+                        value = getattr(member, name, None)
+                        if value is not None:
+                            payload[name] = value
+                    await self._record_qq_invitation(payload)
+
+                client.on_group_member_add = handle_member
+                client.on_group_member_remove = handle_member_remove
+                logger.info("FAPI subscribed to QQ official group member events")
+            except Exception:
+                logger.exception("FAPI failed to register QQ official group member event handlers")
 
     async def _invitation_worker_loop(self) -> None:
         while True:

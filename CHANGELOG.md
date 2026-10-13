@@ -1,4 +1,4 @@
-# 更新记录
+## 4.1.2\n\n- Subscribe directly to QQ Official group member add/remove callbacks and send invitation notices through the group session.\n\n# 更新记录
 
 ## 4.1.1
 
