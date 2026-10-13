@@ -250,6 +250,9 @@ class FapiPlugin(Star):
         self._daily_broadcast_task: asyncio.Task | None = None
         self._invitation_task: asyncio.Task | None = None
         self._qq_member_clients: set[int] = set()
+        self._qq_member_install_task = asyncio.create_task(
+            self.on_platform_loaded()
+        )
         self._invitation_threshold = max(1, int(config.get("invitation_threshold", 5)))
         self._invitation_reward_units = money_to_units(
             config.get("invitation_reward", "0.50")
@@ -1408,6 +1411,11 @@ class FapiPlugin(Star):
         yield event.plain_result(self._game_reply(settled))
 
     async def terminate(self) -> None:
+        if self._qq_member_install_task is not None:
+            self._qq_member_install_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._qq_member_install_task
+            self._qq_member_install_task = None
         for attribute, task_name in (
             ("_daily_broadcast_task", "每日播报"),
             ("_invitation_task", "邀请奖励"),
