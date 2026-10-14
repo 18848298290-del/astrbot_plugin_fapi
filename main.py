@@ -58,15 +58,6 @@ from .tokenrouter_client import (
 
 _SUPPORTED_QQ_PLATFORMS = frozenset({"aiocqhttp", "qq_official"})
 _GAME_REFUND_MAX_ATTEMPTS = 5
-_FISHING_CATCHES = (
-    ("普通", "小鲫鱼", 80, 420),
-    ("普通", "河虾", 30, 120),
-    ("少见", "鲈鱼", 250, 850),
-    ("少见", "鲤鱼", 400, 1_500),
-    ("稀有", "金枪鱼", 900, 3_500),
-    ("稀有", "锦鲤", 500, 1_800),
-    ("传说", "巨物鲟鱼", 4_000, 12_000),
-)
 _REPLY_MARKUP_TRANSLATION = str.maketrans(
     {
         "\\": "＼",
@@ -107,7 +98,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和打劫",
-    "4.1.5",
+    "4.1.6",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -334,19 +325,6 @@ class FapiPlugin(Star):
                 raise ValueError("打劫冷却时间必须在 0 到 86400 秒之间")
         except ValueError as exc:
             self._game_config_error = str(exc)
-
-        self._fishing_config_error = ""
-        try:
-            self._fishing_enabled = bool(config.get("fishing_enabled", True))
-            self._fishing_cooldown_seconds = int(
-                config.get("fishing_cooldown_seconds", 120)
-            )
-            if not 0 <= self._fishing_cooldown_seconds <= 86400:
-                raise ValueError("钓鱼冷却时间必须在 0 到 86400 秒之间")
-        except ValueError as exc:
-            self._fishing_config_error = str(exc)
-            self._fishing_enabled = False
-            self._fishing_cooldown_seconds = 120
 
         self._transfer_config_error = ""
         try:
@@ -786,7 +764,6 @@ class FapiPlugin(Star):
             "/fapi 红包状态 [红包编号]\n"
             "/fapi 红包排行\n"
             "/fapi 账单\n"
-            "/fapi 钓鱼\n"
             "/fapi 打劫 @用户\n"
             "/fapi 转账 @用户 <金额>\n"
             "/fapi 帮助\n\n"
@@ -1364,74 +1341,6 @@ class FapiPlugin(Star):
             return
         settled = await self._settle_game_operation(operation)
         yield event.plain_result(self._game_reply(settled))
-
-    @fapi.command("钓鱼", alias={"fish"})
-    async def fishing(self, event: AstrMessageEvent):
-        """在指定群中进行一次无余额变动的娱乐钓鱼。"""
-        command_context, context_error = self._group_command_context(event)
-        if context_error:
-            yield event.plain_result(context_error)
-            return
-        assert command_context is not None
-        if self._fishing_config_error:
-            yield event.plain_result("钓鱼配置不正确，请联系管理员检查插件配置。")
-            return
-        if not self._fishing_enabled:
-            yield event.plain_result("钓鱼功能当前未开启。")
-            return
-        operation_key = self._game_operation_key(event, command_context, "fishing")
-        if operation_key is None:
-            yield event.plain_result("无法确认当前消息编号，本次钓鱼已取消。")
-            return
-
-        early_reply = ""
-        try:
-            async with self._game_command_lock:
-                operation = await self.games.get_by_key(operation_key)
-                if operation is None:
-                    binding = await self.bindings.get_by_qq(command_context.sender_id)
-                    if binding is None:
-                        early_reply = "当前账号尚未绑定 TokenRouter 账户，请先使用 /fapi 绑定。"
-                    else:
-                        operation = (
-                            await self.games.reserve_game(
-                                operation_key=operation_key,
-                                game_type="fishing",
-                                group_id=command_context.group_id,
-                                actor_qq_id=command_context.sender_id,
-                                actor_user_id=binding.tokenrouter_user_id,
-                                debit_user_id=binding.tokenrouter_user_id,
-                                debit_units=0,
-                                credit_units=0,
-                                won=True,
-                                cooldown_seconds=self._fishing_cooldown_seconds,
-                            )
-                        ).operation
-        except GameCooldownActive as exc:
-            yield event.plain_result(
-                f"鱼还没上钩，请在 {exc.retry_after_seconds} 秒后再试。"
-            )
-            return
-        except BindingDatabaseError as exc:
-            logger.error("FAPI 查询钓鱼绑定关系失败：%s", exc)
-            yield event.plain_result("远程绑定数据库暂时不可用，请稍后重试。")
-            return
-        except (GameDatabaseError, GameOperationConflict) as exc:
-            logger.error("FAPI 记录钓鱼结果失败：%s", exc)
-            yield event.plain_result("钓鱼记录暂时不可用，请稍后重试。")
-            return
-
-        if early_reply:
-            yield event.plain_result(early_reply)
-            return
-        assert operation is not None
-        rarity, fish_name, weight_grams = self._fishing_catch(operation.operation_key)
-        yield event.plain_result(
-            f"钓鱼成功\n"
-            f"鱼获：{rarity} {fish_name}\n"
-            f"重量：{weight_grams} g\n"
-            "本次仅为娱乐记录，不会变动余额。"
-        )
 
     @fapi.command("转账", alias={"transfer", "转余额"})
     async def transfer(
@@ -2044,21 +1953,6 @@ class FapiPlugin(Star):
         )
 
     @staticmethod
-    def _fishing_catch(operation_key: str) -> tuple[str, str, int]:
-        digest = hashlib.sha256(operation_key.encode("utf-8")).digest()
-        roll = digest[0]
-        if roll < 3:
-            rarity, fish_name, minimum, maximum = _FISHING_CATCHES[6]
-        elif roll < 20:
-            rarity, fish_name, minimum, maximum = _FISHING_CATCHES[4 + digest[1] % 2]
-        elif roll < 85:
-            rarity, fish_name, minimum, maximum = _FISHING_CATCHES[2 + digest[1] % 2]
-        else:
-            rarity, fish_name, minimum, maximum = _FISHING_CATCHES[digest[1] % 2]
-        weight = minimum + int.from_bytes(digest[2:4], "big") % (maximum - minimum + 1)
-        return rarity, fish_name, weight
-
-    @staticmethod
     def _checkin_success_reply(reservation: CheckinReservation) -> str:
         return (
             "签到成功\n"
@@ -2322,8 +2216,6 @@ class FapiPlugin(Star):
         operation: GameOperation,
         tokenrouter_user_id: int,
     ) -> str:
-        if operation.game_type == "fishing":
-            return ""
         timestamp = self._format_ledger_time(operation.created_at)
         is_debit = operation.debit_user_id == tokenrouter_user_id
         is_credit = operation.credit_user_id == tokenrouter_user_id

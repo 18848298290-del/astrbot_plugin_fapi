@@ -180,18 +180,6 @@
     "default": 300,
     "slider": {"min": 0, "max": 86400, "step": 1}
   },
-  "fishing_enabled": {
-    "description": "启用娱乐钓鱼",
-    "type": "bool",
-    "hint": "钓鱼只记录娱乐鱼获，不会变动 TokenRouter 余额。",
-    "default": true
-  },
-  "fishing_cooldown_seconds": {
-    "description": "钓鱼冷却秒数",
-    "type": "int",
-    "default": 120,
-    "slider": {"min": 0, "max": 86400, "step": 1}
-  },
   "transfer_max_amount": {
     "description": "单次转账上限",
     "type": "string",

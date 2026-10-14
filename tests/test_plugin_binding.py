@@ -1387,30 +1387,6 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             self.plugin._mentioned_target_id(multiple_targets, command_context)
         )
 
-    async def test_fishing_records_a_non_financial_operation(self):
-        games = InMemoryGameStore(self.module)
-        self.plugin.bindings = GameBindings({"12345": 11})
-        self.plugin.games = games
-
-        replies = await collect(self.plugin.fishing(FakeEvent()))
-
-        self.assertEqual(len(replies), 1)
-        self.assertIn("钓鱼成功", replies[0])
-        self.assertIn("不会变动余额", replies[0])
-        self.assertEqual(games.reserve_calls[0]["game_type"], "fishing")
-        self.assertEqual(games.reserve_calls[0]["debit_units"], 0)
-        self.assertEqual(games.reserve_calls[0]["credit_units"], 0)
-
-    async def test_fishing_requires_a_bound_account(self):
-        games = InMemoryGameStore(self.module)
-        self.plugin.bindings = GameBindings({})
-        self.plugin.games = games
-
-        replies = await collect(self.plugin.fishing(FakeEvent()))
-
-        self.assertEqual(replies, ["当前账号尚未绑定 TokenRouter 账户，请先使用 /fapi 绑定。"])
-        self.assertEqual(games.reserve_calls, [])
-
     async def test_transfer_moves_balance_between_bound_users(self):
         event = FakeEvent(messages=[SimpleNamespace(type="At", qq="67890")])
         games = InMemoryGameStore(self.module)
@@ -1439,13 +1415,6 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(replies, ["请只 @ 一名其他群成员：/fapi 转账 @用户 <金额>"])
         self.assertEqual(games.reserve_calls, [])
-
-    def test_fishing_result_is_deterministic(self):
-        first = self.plugin._fishing_catch("fapi-game:v1:fishing:example")
-        second = self.plugin._fishing_catch("fapi-game:v1:fishing:example")
-
-        self.assertEqual(first, second)
-        self.assertGreater(first[2], 0)
 
     async def test_robbery_success_transfers_between_bound_users_once(self):
         event = FakeEvent(
