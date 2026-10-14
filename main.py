@@ -107,7 +107,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和打劫",
-    "4.1.4",
+    "4.1.5",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -1437,7 +1437,7 @@ class FapiPlugin(Star):
     async def transfer(
         self,
         event: AstrMessageEvent,
-        amount: str = "",
+        raw_args: GreedyStr,
     ):
         """将已绑定账户余额转给一名被 @ 的群成员。"""
         command_context, context_error = self._group_command_context(event)
@@ -1448,11 +1448,18 @@ class FapiPlugin(Star):
         if self._transfer_config_error:
             yield event.plain_result("转账配置不正确，请联系管理员检查插件配置。")
             return
-        if not amount.strip():
+        amount_candidates: list[str] = []
+        for argument in str(raw_args).strip().split():
+            try:
+                money_to_units(argument)
+            except ValueError:
+                continue
+            amount_candidates.append(argument)
+        if len(amount_candidates) != 1:
             yield event.plain_result("用法：/fapi 转账 @用户 <金额>")
             return
         try:
-            amount_units = money_to_units(amount)
+            amount_units = money_to_units(amount_candidates[0])
         except ValueError:
             yield event.plain_result("转账金额必须是大于 0、最多 8 位小数的数字。")
             return

@@ -1419,7 +1419,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.plugin.games = games
         self.plugin.client = client
 
-        replies = await collect(self.plugin.transfer(event, "2.50"))
+        replies = await collect(self.plugin.transfer(event, "@小羊 2.50"))
 
         self.assertEqual(len(replies), 1)
         self.assertIn("转账成功", replies[0])
