@@ -114,22 +114,6 @@ class DailyRewardStats:
     claim_units: int
 
 
-@dataclass(frozen=True, slots=True)
-class InvitationEvent:
-    event_key: str
-    group_id: str
-    inviter_qq_id: str
-    invitee_qq_id: str
-    joined_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class InvitationSettlement:
-    inviter_qq_id: str
-    valid_count: int
-    reward_job: RewardJob | None
-
-
 def money_to_units(value: Any, *, allow_zero: bool = False) -> int:
     try:
         amount = Decimal(str(value).strip())
@@ -210,8 +194,6 @@ class MySQLRewardStore:
         claims_table: str = "astrbot_fapi_red_claims",
         budgets_table: str = "astrbot_fapi_reward_budgets",
         broadcasts_table: str = "astrbot_fapi_daily_broadcasts",
-        invitations_table: str = "astrbot_fapi_invitations",
-        invitation_stats_table: str = "astrbot_fapi_invitation_stats",
         connect_timeout: int = 10,
         ssl_enabled: bool = True,
         ssl_verify: bool = True,
@@ -227,8 +209,6 @@ class MySQLRewardStore:
         self.claims_table = claims_table.strip()
         self.budgets_table = budgets_table.strip()
         self.broadcasts_table = broadcasts_table.strip()
-        self.invitations_table = invitations_table.strip()
-        self.invitation_stats_table = invitation_stats_table.strip()
         self.connect_timeout = max(1, connect_timeout)
         self.ssl_enabled = ssl_enabled
         self.ssl_verify = ssl_verify
@@ -625,196 +605,6 @@ class MySQLRewardStore:
         except Exception as exc:
             raise RewardDatabaseError("读取奖励任务失败") from exc
         return _row_to_job(row) if row else None
-
-    async def record_invitation_event(
-        self,
-        *,
-        event_key: str,
-        group_id: str,
-        inviter_qq_id: str,
-        invitee_qq_id: str,
-    ) -> bool:
-        """Record a raw join event once; maturity is settled separately."""
-        await self.initialize()
-        try:
-            async with self._pool.acquire() as connection:
-                async with connection.cursor() as cursor:
-                    await cursor.execute(
-                        f"""
-                        INSERT IGNORE INTO `{self.invitations_table}`
-                            (event_key, group_id, inviter_qq_id, invitee_qq_id)
-                        VALUES (%s, %s, %s, %s)
-                        """,
-                        (event_key, group_id, inviter_qq_id, invitee_qq_id),
-                    )
-                    return cursor.rowcount == 1
-        except Exception as exc:
-            raise RewardDatabaseError("记录邀请事件失败") from exc
-
-    async def invalidate_invitation_event(
-        self, *, group_id: str, invitee_qq_id: str
-    ) -> bool:
-        """Invalidate an uncounted invitation when the member leaves."""
-        await self.initialize()
-        try:
-            async with self._pool.acquire() as connection:
-                async with connection.cursor() as cursor:
-                    await cursor.execute(
-                        f"""
-                        UPDATE `{self.invitations_table}`
-                        SET invalidated_at = UTC_TIMESTAMP(6)
-                        WHERE group_id = %s AND invitee_qq_id = %s
-                          AND counted_at IS NULL AND invalidated_at IS NULL
-                        """,
-                        (group_id, invitee_qq_id),
-                    )
-                    return cursor.rowcount == 1
-        except Exception as exc:
-            raise RewardDatabaseError("标记邀请失效失败") from exc
-
-    async def list_mature_invitation_events(
-        self, *, maturity_hours: int, limit: int = 50
-    ) -> list[InvitationEvent]:
-        await self.initialize()
-        safe_limit = max(1, min(int(limit), 200))
-        try:
-            async with self._pool.acquire() as connection:
-                async with connection.cursor() as cursor:
-                    await cursor.execute(
-                        f"""
-                        SELECT event_key, group_id, inviter_qq_id, invitee_qq_id,
-                               joined_at
-                        FROM `{self.invitations_table}`
-                        WHERE counted_at IS NULL AND invalidated_at IS NULL
-                          AND joined_at <= DATE_SUB(UTC_TIMESTAMP(6),
-                              INTERVAL %s HOUR)
-                        ORDER BY joined_at ASC
-                        LIMIT {safe_limit}
-                        """,
-                        (max(0, int(maturity_hours)),),
-                    )
-                    rows = await cursor.fetchall()
-        except Exception as exc:
-            raise RewardDatabaseError("读取待结算邀请失败") from exc
-        return [
-            InvitationEvent(
-                event_key=str(row["event_key"]),
-                group_id=str(row["group_id"]),
-                inviter_qq_id=str(row["inviter_qq_id"]),
-                invitee_qq_id=str(row["invitee_qq_id"]),
-                joined_at=row["joined_at"],
-            )
-            for row in rows
-        ]
-
-    async def settle_invitation_event(
-        self,
-        *,
-        event: InvitationEvent,
-        tokenrouter_user_id: int,
-        threshold: int,
-        reward_units: int,
-    ) -> InvitationSettlement | None:
-        await self.initialize()
-        safe_threshold = max(1, int(threshold))
-        try:
-            async with self._pool.acquire() as connection:
-                await connection.begin()
-                try:
-                    async with connection.cursor() as cursor:
-                        await cursor.execute(
-                            f"SELECT counted_at FROM `{self.invitations_table}` "
-                            "WHERE event_key = %s FOR UPDATE",
-                            (event.event_key,),
-                        )
-                        row = await cursor.fetchone()
-                        if row is None or row["counted_at"] is not None:
-                            await connection.rollback()
-                            return None
-                        await cursor.execute(
-                            f"""
-                            INSERT INTO `{self.invitation_stats_table}`
-                                (group_id, inviter_qq_id, valid_count, rewarded_count)
-                            VALUES (%s, %s, 1, 0)
-                            ON DUPLICATE KEY UPDATE valid_count = valid_count + 1
-                            """,
-                            (event.group_id, event.inviter_qq_id),
-                        )
-                        await cursor.execute(
-                            f"""SELECT valid_count, rewarded_count
-                                FROM `{self.invitation_stats_table}`
-                                WHERE group_id = %s AND inviter_qq_id = %s FOR UPDATE""",
-                            (event.group_id, event.inviter_qq_id),
-                        )
-                        stats = await cursor.fetchone()
-                        valid_count = int(stats["valid_count"])
-                        rewarded_count = int(stats["rewarded_count"])
-                        reward_job = None
-                        if valid_count // safe_threshold > rewarded_count:
-                            operation_id = str(uuid.uuid4())
-                            redeem_code = _redeem_code(operation_id)
-                            await self._insert_reward_job(
-                                connection,
-                                operation_id=operation_id,
-                                source_type="invitation",
-                                qq_id=event.inviter_qq_id,
-                                tokenrouter_user_id=int(tokenrouter_user_id),
-                                amount_units=int(reward_units),
-                                redeem_code=redeem_code,
-                            )
-                            await cursor.execute(
-                                f"UPDATE `{self.invitation_stats_table}` "
-                                "SET rewarded_count = rewarded_count + 1 "
-                                "WHERE group_id = %s AND inviter_qq_id = %s",
-                                (event.group_id, event.inviter_qq_id),
-                            )
-                            reward_job = RewardJob(
-                                operation_id=operation_id,
-                                source_type="invitation",
-                                qq_id=event.inviter_qq_id,
-                                tokenrouter_user_id=int(tokenrouter_user_id),
-                                amount_units=int(reward_units),
-                                redeem_code=redeem_code,
-                                status=RewardJobStatus.PENDING,
-                                attempt_count=0,
-                            )
-                        await cursor.execute(
-                            f"UPDATE `{self.invitations_table}` SET counted_at = UTC_TIMESTAMP(6) "
-                            "WHERE event_key = %s",
-                            (event.event_key,),
-                        )
-                    await connection.commit()
-                    return InvitationSettlement(event.inviter_qq_id, valid_count, reward_job)
-                except Exception:
-                    await connection.rollback()
-                    raise
-        except RewardDatabaseError:
-            raise
-        except Exception as exc:
-            raise RewardDatabaseError("结算邀请奖励失败") from exc
-
-    async def get_invitation_ranking(
-        self, *, group_id: str, limit: int = 10
-    ) -> list[tuple[str, int, int]]:
-        await self.initialize()
-        safe_limit = max(1, min(int(limit), 20))
-        try:
-            async with self._pool.acquire() as connection:
-                async with connection.cursor() as cursor:
-                    await cursor.execute(
-                        f"""SELECT inviter_qq_id, valid_count, rewarded_count
-                        FROM `{self.invitation_stats_table}`
-                        WHERE group_id = %s ORDER BY valid_count DESC, inviter_qq_id ASC
-                        LIMIT {safe_limit}""",
-                        (group_id,),
-                    )
-                    rows = await cursor.fetchall()
-        except Exception as exc:
-            raise RewardDatabaseError("读取邀请排行榜失败") from exc
-        return [
-            (str(row["inviter_qq_id"]), int(row["valid_count"]), int(row["rewarded_count"]))
-            for row in rows
-        ]
 
     async def list_pending_jobs(self, limit: int = 20) -> list[RewardJob]:
         await self.initialize()
@@ -1256,55 +1046,13 @@ class MySQLRewardStore:
                     KEY idx_fapi_broadcast_lease (sent_at, lease_expires_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
-            f"""
-                CREATE TABLE IF NOT EXISTS `{self.invitations_table}` (
-                    event_key VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-                    group_id VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-                    inviter_qq_id VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-                    invitee_qq_id VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-                    joined_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                    counted_at DATETIME(6) NULL,
-                    invalidated_at DATETIME(6) NULL,
-                    PRIMARY KEY (event_key),
-                    UNIQUE KEY uq_fapi_invitee_once (group_id, invitee_qq_id),
-                    KEY idx_fapi_invitation_pending (counted_at, joined_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """,
-            f"""
-                CREATE TABLE IF NOT EXISTS `{self.invitation_stats_table}` (
-                    group_id VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-                    inviter_qq_id VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-                    valid_count INT UNSIGNED NOT NULL DEFAULT 0,
-                    rewarded_count INT UNSIGNED NOT NULL DEFAULT 0,
-                    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-                        ON UPDATE CURRENT_TIMESTAMP(6),
-                    PRIMARY KEY (group_id, inviter_qq_id)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """,
         ]
         async with self._pool.acquire() as connection:
             async with connection.cursor() as cursor:
                 for statement in statements:
                     await cursor.execute(statement)
                 await self._ensure_platform_id_columns(cursor)
-                await self._ensure_invitation_columns(cursor)
             await connection.commit()
-
-    async def _ensure_invitation_columns(self, cursor: Any) -> None:
-        await cursor.execute(
-            """
-            SELECT COLUMN_NAME FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME = %s AND COLUMN_NAME = 'invalidated_at'
-            LIMIT 1
-            """,
-            (self.invitations_table,),
-        )
-        if await cursor.fetchone() is None:
-            await cursor.execute(
-                f"ALTER TABLE `{self.invitations_table}` "
-                "ADD COLUMN invalidated_at DATETIME(6) NULL AFTER counted_at"
-            )
 
     async def _ensure_platform_id_columns(self, cursor: Any) -> None:
         columns = (
@@ -1567,10 +1315,8 @@ class MySQLRewardStore:
             self.claims_table,
             self.budgets_table,
             self.broadcasts_table,
-            self.invitations_table,
-            self.invitation_stats_table,
         }
-        if len(table_names) != 8:
+        if len(table_names) != 6:
             raise RewardDatabaseError("奖励数据表名称不能重复")
         if not all(_IDENTIFIER_PATTERN.fullmatch(name) for name in table_names):
             raise RewardDatabaseError("奖励数据表名称不合法")

@@ -42,7 +42,6 @@ from .reward_store import (
     RewardDatabaseError,
     RewardJob,
     RewardJobStatus,
-    InvitationEvent,
     money_to_units,
     units_to_decimal,
 )
@@ -58,30 +57,16 @@ from .tokenrouter_client import (
 
 
 _SUPPORTED_QQ_PLATFORMS = frozenset({"aiocqhttp", "qq_official"})
-_EVENT_ALL = getattr(getattr(filter, "EventMessageType", None), "ALL", None)
-_QQ_OFFICIAL = getattr(getattr(filter, "PlatformAdapterType", None), "QQOFFICIAL", None)
-
-
-def _optional_event_filter(factory, value):
-    if factory is None or value is None:
-        return lambda function: function
-    return factory(value)
-
-
-_event_message_type = _optional_event_filter(
-    getattr(filter, "event_message_type", None), _EVENT_ALL
-)
-_platform_adapter_type = _optional_event_filter(
-    getattr(filter, "platform_adapter_type", None), _QQ_OFFICIAL
-)
-_on_platform_loaded = getattr(filter, "on_platform_loaded", None)
-
-
-def _optional_hook(factory):
-    if factory is None:
-        return lambda function: function
-    return factory()
 _GAME_REFUND_MAX_ATTEMPTS = 5
+_FISHING_CATCHES = (
+    ("普通", "小鲫鱼", 80, 420),
+    ("普通", "河虾", 30, 120),
+    ("少见", "鲈鱼", 250, 850),
+    ("少见", "鲤鱼", 400, 1_500),
+    ("稀有", "金枪鱼", 900, 3_500),
+    ("稀有", "锦鲤", 500, 1_800),
+    ("传说", "巨物鲟鱼", 4_000, 12_000),
+)
 _REPLY_MARKUP_TRANSLATION = str.maketrans(
     {
         "\\": "＼",
@@ -122,7 +107,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和打劫",
-    "4.1.2",
+    "4.1.4",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -186,15 +171,6 @@ class FapiPlugin(Star):
                     "astrbot_fapi_game_cooldowns",
                 )
             ).strip(),
-            "mysql_invitations_table": str(
-                config.get("mysql_invitations_table", "astrbot_fapi_invitations")
-            ).strip(),
-            "mysql_invitation_stats_table": str(
-                config.get(
-                    "mysql_invitation_stats_table",
-                    "astrbot_fapi_invitation_stats",
-                )
-            ).strip(),
         }
         self._validate_unique_table_names(table_names)
         request_timeout = float(config.get("request_timeout", 10))
@@ -234,8 +210,6 @@ class FapiPlugin(Star):
             claims_table=table_names["mysql_red_claims_table"],
             budgets_table=table_names["mysql_reward_budgets_table"],
             broadcasts_table=table_names["mysql_daily_broadcasts_table"],
-            invitations_table=table_names["mysql_invitations_table"],
-            invitation_stats_table=table_names["mysql_invitation_stats_table"],
         )
         self.games = MySQLGameStore(
             **mysql_options,
@@ -248,18 +222,6 @@ class FapiPlugin(Star):
         self._game_delivery_lock = asyncio.Lock()
         self._game_worker_task: asyncio.Task | None = None
         self._daily_broadcast_task: asyncio.Task | None = None
-        self._invitation_task: asyncio.Task | None = None
-        self._qq_member_clients: set[int] = set()
-        self._qq_member_install_task = asyncio.create_task(
-            self.on_platform_loaded()
-        )
-        self._invitation_threshold = max(1, int(config.get("invitation_threshold", 5)))
-        self._invitation_reward_units = money_to_units(
-            config.get("invitation_reward", "0.50")
-        )
-        self._invitation_maturity_hours = max(
-            0, min(int(config.get("invitation_maturity_hours", 24)), 720)
-        )
         self._daily_broadcast_enabled = bool(
             config.get("daily_broadcast_enabled", False)
         )
@@ -372,6 +334,28 @@ class FapiPlugin(Star):
                 raise ValueError("打劫冷却时间必须在 0 到 86400 秒之间")
         except ValueError as exc:
             self._game_config_error = str(exc)
+
+        self._fishing_config_error = ""
+        try:
+            self._fishing_enabled = bool(config.get("fishing_enabled", True))
+            self._fishing_cooldown_seconds = int(
+                config.get("fishing_cooldown_seconds", 120)
+            )
+            if not 0 <= self._fishing_cooldown_seconds <= 86400:
+                raise ValueError("钓鱼冷却时间必须在 0 到 86400 秒之间")
+        except ValueError as exc:
+            self._fishing_config_error = str(exc)
+            self._fishing_enabled = False
+            self._fishing_cooldown_seconds = 120
+
+        self._transfer_config_error = ""
+        try:
+            self._transfer_max_units = money_to_units(
+                config.get("transfer_max_amount", "1000.00")
+            )
+        except ValueError as exc:
+            self._transfer_config_error = str(exc)
+            self._transfer_max_units = 0
 
     async def initialize(self) -> None:
         try:
@@ -797,13 +781,14 @@ class FapiPlugin(Star):
             "/fapi 余额\n"
             "/fapi 签到\n"
             "/fapi 签到排行\n"
-            "/fapi 邀请排行\n"
             "/fapi 红包 <总金额> <份数>\n"
             "/fapi 抢红包 [红包编号]\n"
             "/fapi 红包状态 [红包编号]\n"
             "/fapi 红包排行\n"
             "/fapi 账单\n"
+            "/fapi 钓鱼\n"
             "/fapi 打劫 @用户\n"
+            "/fapi 转账 @用户 <金额>\n"
             "/fapi 帮助\n\n"
             f"{red_packet_permission}"
         )
@@ -944,36 +929,6 @@ class FapiPlugin(Star):
             yield event.plain_result("排行数据库暂时不可用，请稍后重试。")
             return
         yield event.plain_result(reply)
-
-    @fapi.command("邀请排行", alias={"invite_rank", "邀请排行榜"})
-    async def invitation_ranking(self, event: AstrMessageEvent):
-        """显示当前群有效邀请人数排行。"""
-        command_context, context_error = self._group_command_context(event)
-        if context_error:
-            yield event.plain_result(context_error)
-            return
-        assert command_context is not None
-        try:
-            entries = await self.rewards.get_invitation_ranking(
-                group_id=command_context.group_id,
-                limit=10,
-            )
-        except RewardDatabaseError as exc:
-            logger.error("FAPI 查询邀请排行失败：%s", exc)
-            yield event.plain_result("邀请排行暂时不可用，请稍后重试。")
-            return
-        if not entries:
-            yield event.plain_result("当前群还没有有效邀请记录。")
-            return
-        lines = ["邀请排行榜（有效留存人数）"]
-        for index, (inviter_id, valid_count, rewarded_count) in enumerate(
-            entries, 1
-        ):
-            display_id = inviter_id if len(inviter_id) <= 8 else f"…{inviter_id[-6:]}"
-            lines.append(
-                f"{index}. {display_id}：{valid_count} 人，已获得 {rewarded_count} 次奖励"
-            )
-        yield event.plain_result("\n".join(lines))
 
     @fapi.command("红包排行", alias={"redpacket_rank"})
     async def red_packet_ranking(self, event: AstrMessageEvent):
@@ -1410,15 +1365,164 @@ class FapiPlugin(Star):
         settled = await self._settle_game_operation(operation)
         yield event.plain_result(self._game_reply(settled))
 
+    @fapi.command("钓鱼", alias={"fish"})
+    async def fishing(self, event: AstrMessageEvent):
+        """在指定群中进行一次无余额变动的娱乐钓鱼。"""
+        command_context, context_error = self._group_command_context(event)
+        if context_error:
+            yield event.plain_result(context_error)
+            return
+        assert command_context is not None
+        if self._fishing_config_error:
+            yield event.plain_result("钓鱼配置不正确，请联系管理员检查插件配置。")
+            return
+        if not self._fishing_enabled:
+            yield event.plain_result("钓鱼功能当前未开启。")
+            return
+        operation_key = self._game_operation_key(event, command_context, "fishing")
+        if operation_key is None:
+            yield event.plain_result("无法确认当前消息编号，本次钓鱼已取消。")
+            return
+
+        early_reply = ""
+        try:
+            async with self._game_command_lock:
+                operation = await self.games.get_by_key(operation_key)
+                if operation is None:
+                    binding = await self.bindings.get_by_qq(command_context.sender_id)
+                    if binding is None:
+                        early_reply = "当前账号尚未绑定 TokenRouter 账户，请先使用 /fapi 绑定。"
+                    else:
+                        operation = (
+                            await self.games.reserve_game(
+                                operation_key=operation_key,
+                                game_type="fishing",
+                                group_id=command_context.group_id,
+                                actor_qq_id=command_context.sender_id,
+                                actor_user_id=binding.tokenrouter_user_id,
+                                debit_user_id=binding.tokenrouter_user_id,
+                                debit_units=0,
+                                credit_units=0,
+                                won=True,
+                                cooldown_seconds=self._fishing_cooldown_seconds,
+                            )
+                        ).operation
+        except GameCooldownActive as exc:
+            yield event.plain_result(
+                f"鱼还没上钩，请在 {exc.retry_after_seconds} 秒后再试。"
+            )
+            return
+        except BindingDatabaseError as exc:
+            logger.error("FAPI 查询钓鱼绑定关系失败：%s", exc)
+            yield event.plain_result("远程绑定数据库暂时不可用，请稍后重试。")
+            return
+        except (GameDatabaseError, GameOperationConflict) as exc:
+            logger.error("FAPI 记录钓鱼结果失败：%s", exc)
+            yield event.plain_result("钓鱼记录暂时不可用，请稍后重试。")
+            return
+
+        if early_reply:
+            yield event.plain_result(early_reply)
+            return
+        assert operation is not None
+        rarity, fish_name, weight_grams = self._fishing_catch(operation.operation_key)
+        yield event.plain_result(
+            f"钓鱼成功\n"
+            f"鱼获：{rarity} {fish_name}\n"
+            f"重量：{weight_grams} g\n"
+            "本次仅为娱乐记录，不会变动余额。"
+        )
+
+    @fapi.command("转账", alias={"transfer", "转余额"})
+    async def transfer(
+        self,
+        event: AstrMessageEvent,
+        amount: str = "",
+    ):
+        """将已绑定账户余额转给一名被 @ 的群成员。"""
+        command_context, context_error = self._group_command_context(event)
+        if context_error:
+            yield event.plain_result(context_error)
+            return
+        assert command_context is not None
+        if self._transfer_config_error:
+            yield event.plain_result("转账配置不正确，请联系管理员检查插件配置。")
+            return
+        if not amount.strip():
+            yield event.plain_result("用法：/fapi 转账 @用户 <金额>")
+            return
+        try:
+            amount_units = money_to_units(amount)
+        except ValueError:
+            yield event.plain_result("转账金额必须是大于 0、最多 8 位小数的数字。")
+            return
+        if amount_units > self._transfer_max_units:
+            yield event.plain_result(
+                f"单次转账不能超过 {self._format_units(self._transfer_max_units)}。"
+            )
+            return
+
+        target_qq_id = self._mentioned_target_id(event, command_context)
+        if target_qq_id is None:
+            yield event.plain_result("请只 @ 一名其他群成员：/fapi 转账 @用户 <金额>")
+            return
+        if target_qq_id == command_context.sender_id:
+            yield event.plain_result("不能向自己转账。")
+            return
+        operation_key = self._game_operation_key(event, command_context, "transfer")
+        if operation_key is None:
+            yield event.plain_result("无法确认当前消息编号，为避免重复扣款，本次转账已取消。")
+            return
+
+        early_reply = ""
+        try:
+            async with self._game_command_lock:
+                operation = await self.games.get_by_key(operation_key)
+                if operation is None:
+                    sender_binding, target_binding = await asyncio.gather(
+                        self.bindings.get_by_qq(command_context.sender_id),
+                        self.bindings.get_by_qq(target_qq_id),
+                    )
+                    if sender_binding is None:
+                        early_reply = "当前账号尚未绑定 TokenRouter 账户，请先使用 /fapi 绑定。"
+                    elif target_binding is None:
+                        early_reply = "被 @ 用户尚未绑定 TokenRouter 账户，无法转账。"
+                    else:
+                        operation = (
+                            await self.games.reserve_game(
+                                operation_key=operation_key,
+                                game_type="transfer",
+                                group_id=command_context.group_id,
+                                actor_qq_id=command_context.sender_id,
+                                actor_user_id=sender_binding.tokenrouter_user_id,
+                                target_qq_id=target_qq_id,
+                                target_user_id=target_binding.tokenrouter_user_id,
+                                debit_user_id=sender_binding.tokenrouter_user_id,
+                                credit_user_id=target_binding.tokenrouter_user_id,
+                                debit_units=amount_units,
+                                credit_units=amount_units,
+                                won=True,
+                            )
+                        ).operation
+        except BindingDatabaseError as exc:
+            logger.error("FAPI 查询转账绑定关系失败：%s", exc)
+            yield event.plain_result("远程绑定数据库暂时不可用，请稍后重试。")
+            return
+        except (GameDatabaseError, GameOperationConflict) as exc:
+            logger.error("FAPI 预留转账操作失败：%s", exc)
+            yield event.plain_result("转账记录暂时不可用，请稍后重试。")
+            return
+
+        if early_reply:
+            yield event.plain_result(early_reply)
+            return
+        assert operation is not None
+        settled = await self._settle_game_operation(operation)
+        yield event.plain_result(self._game_reply(settled))
+
     async def terminate(self) -> None:
-        if self._qq_member_install_task is not None:
-            self._qq_member_install_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._qq_member_install_task
-            self._qq_member_install_task = None
         for attribute, task_name in (
             ("_daily_broadcast_task", "每日播报"),
-            ("_invitation_task", "邀请奖励"),
             ("_game_worker_task", "游戏结算"),
             ("_reward_worker_task", "奖励补发"),
         ):
@@ -1520,119 +1624,6 @@ class FapiPlugin(Star):
             except Exception:
                 logger.exception("FAPI 奖励补发任务执行失败")
             await asyncio.sleep(15)
-
-    async def _record_qq_invitation(self, payload: dict) -> str | None:
-        data = payload.get("d") if isinstance(payload.get("d"), dict) else payload
-        event_type = str(payload.get("event_type") or payload.get("t") or data.get("event_type") or data.get("type") or "").upper()
-        if event_type not in {"GROUP_MEMBER_ADD", "GROUP_MEMBER_INCREASE", "GROUP_MEMBER_REMOVE", "GROUP_MEMBER_DECREASE"}:
-            return None
-        group_id = str(data.get("group_openid") or data.get("group_id") or "").strip()
-        invitee_id = str(data.get("member_openid") or data.get("member_id") or data.get("user_openid") or "").strip()
-        inviter_id = str(data.get("op_member_openid") or data.get("inviter_openid") or data.get("operator_openid") or "").strip()
-        if not group_id or not invitee_id or not self._allowed_group_id or group_id != self._allowed_group_id:
-            return None
-        if event_type in {"GROUP_MEMBER_REMOVE", "GROUP_MEMBER_DECREASE"}:
-            with contextlib.suppress(RewardDatabaseError):
-                await self.rewards.invalidate_invitation_event(group_id=group_id, invitee_qq_id=invitee_id)
-            return None
-        if not inviter_id or inviter_id == invitee_id:
-            logger.warning("FAPI group member event missing inviter: group=%s member=%s", group_id, invitee_id)
-            return None
-        event_id = str(payload.get("id") or payload.get("event_id") or data.get("id") or data.get("event_id") or "").strip()
-        event_key = event_id or hashlib.sha256(f"{group_id}:{invitee_id}".encode("utf-8")).hexdigest()
-        try:
-            created = await self.rewards.record_invitation_event(event_key=event_key, group_id=group_id, inviter_qq_id=inviter_id, invitee_qq_id=invitee_id)
-            if not created:
-                return None
-            inviter_name = str(data.get("op_member_name") or data.get("inviter_name") or inviter_id[-6:]).strip()
-            invitee_name = str(data.get("member_name") or data.get("member_nick") or data.get("username") or invitee_id[-6:]).strip()
-            return f"邀请提示：{inviter_name} 邀请了 {invitee_name} 加入本群！连续留存 {self._invitation_maturity_hours} 小时后计入有效邀请。"
-        except RewardDatabaseError as exc:
-            logger.error("FAPI invitation event recording failed: %s", exc)
-            return None
-
-    @_event_message_type
-    @_platform_adapter_type
-    async def on_qq_official_event(self, event: AstrMessageEvent):
-        payload = getattr(getattr(event, "message_obj", None), "raw_message", None) or getattr(event, "raw_message", None)
-        if not isinstance(payload, dict):
-            return
-        notice = await self._record_qq_invitation(payload)
-        if notice:
-            yield event.plain_result(notice)
-
-    @_optional_hook(_on_platform_loaded)
-    async def on_platform_loaded(self):
-        manager = getattr(self.context, "platform_manager", None)
-        for platform in (manager.get_insts() if manager else ()):
-            try:
-                if platform.meta().name != "qq_official":
-                    continue
-                client = getattr(platform, "client", None)
-                intents = getattr(platform, "intents", None)
-                if client is None or intents is None or not hasattr(intents, "group_member_event"):
-                    logger.warning("FAPI QQ official adapter has no group_member_event intent")
-                    continue
-                intents.group_member_event = True
-                if id(client) in self._qq_member_clients:
-                    continue
-                self._qq_member_clients.add(id(client))
-
-                async def handle_member(member, *, _platform=platform):
-                    payload = {"event_type": "GROUP_MEMBER_ADD"}
-                    for name in ("group_openid", "member_openid", "op_member_openid", "username", "id", "event_id"):
-                        value = getattr(member, name, None)
-                        if value is not None:
-                            payload[name] = value
-                    notice = await self._record_qq_invitation(payload)
-                    if notice:
-                        from astrbot.api.event import MessageChain
-                        group_id = str(payload.get("group_openid", "")).strip()
-                        platform_id = str(_platform.meta().id).strip()
-                        if group_id and platform_id:
-                            await self.context.send_message(f"{platform_id}:GroupMessage:{group_id}", MessageChain().message(notice))
-
-                async def handle_member_remove(member):
-                    payload = {"event_type": "GROUP_MEMBER_REMOVE"}
-                    for name in ("group_openid", "member_openid", "op_member_openid", "id"):
-                        value = getattr(member, name, None)
-                        if value is not None:
-                            payload[name] = value
-                    await self._record_qq_invitation(payload)
-
-                client.on_group_member_add = handle_member
-                client.on_group_member_remove = handle_member_remove
-                logger.info("FAPI subscribed to QQ official group member events")
-            except Exception:
-                logger.exception("FAPI failed to register QQ official group member event handlers")
-
-    async def _invitation_worker_loop(self) -> None:
-        while True:
-            try:
-                if not hasattr(self.rewards, "list_mature_invitation_events"):
-                    await asyncio.sleep(60)
-                    continue
-                events = await self.rewards.list_mature_invitation_events(
-                    maturity_hours=self._invitation_maturity_hours,
-                    limit=50,
-                )
-                for invitation in events:
-                    binding = await self.bindings.get_by_qq(invitation.inviter_qq_id)
-                    if binding is None:
-                        continue
-                    settlement = await self.rewards.settle_invitation_event(
-                        event=invitation,
-                        tokenrouter_user_id=binding.tokenrouter_user_id,
-                        threshold=self._invitation_threshold,
-                        reward_units=self._invitation_reward_units,
-                    )
-                    if settlement and settlement.reward_job:
-                        await self._deliver_reward(settlement.reward_job)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("FAPI 邀请奖励结算失败")
-            await asyncio.sleep(60)
 
     async def _settle_game_operation(
         self,
@@ -1925,11 +1916,6 @@ class FapiPlugin(Star):
                 self._game_worker_loop(),
                 name="fapi-game-worker",
             )
-        if self._invitation_task is None or self._invitation_task.done():
-            self._invitation_task = asyncio.create_task(
-                self._invitation_worker_loop(),
-                name="fapi-invitation-worker",
-            )
         if (
             self._daily_broadcast_enabled
             and not self._daily_broadcast_error
@@ -1982,6 +1968,24 @@ class FapiPlugin(Star):
             GameStatus.PENDING_CREDIT,
             GameStatus.PENDING_REFUND,
         }
+        if operation.game_type == "transfer":
+            if operation.status in pending:
+                return "转账正在结算，请稍后使用余额或账单确认。"
+            if operation.status == GameStatus.MANUAL_REVIEW:
+                return "转账入账异常，退款需要管理员人工处理。"
+            if operation.status == GameStatus.INSUFFICIENT:
+                return "余额不足，本次转账未发生余额变动。"
+            if operation.status == GameStatus.REFUNDED:
+                return "转账入账失败，扣除的金额已退回付款账户。"
+            if operation.status == GameStatus.FAILED:
+                return "转账失败，本次未扣款。"
+            if operation.status == GameStatus.SUCCEEDED:
+                return (
+                    "转账成功\n"
+                    f"金额：{FapiPlugin._format_units(operation.credit_units)}\n"
+                    "金额已转入对方账户。"
+                )
+            return "转账状态无法识别，请稍后查询账单。"
         if operation.game_type == "robbery":
             backfired = FapiPlugin._is_robbery_backfire(operation)
             if operation.status in pending:
@@ -2031,6 +2035,21 @@ class FapiPlugin(Star):
             and operation.target_user_id is not None
             and operation.credit_user_id == operation.target_user_id
         )
+
+    @staticmethod
+    def _fishing_catch(operation_key: str) -> tuple[str, str, int]:
+        digest = hashlib.sha256(operation_key.encode("utf-8")).digest()
+        roll = digest[0]
+        if roll < 3:
+            rarity, fish_name, minimum, maximum = _FISHING_CATCHES[6]
+        elif roll < 20:
+            rarity, fish_name, minimum, maximum = _FISHING_CATCHES[4 + digest[1] % 2]
+        elif roll < 85:
+            rarity, fish_name, minimum, maximum = _FISHING_CATCHES[2 + digest[1] % 2]
+        else:
+            rarity, fish_name, minimum, maximum = _FISHING_CATCHES[digest[1] % 2]
+        weight = minimum + int.from_bytes(digest[2:4], "big") % (maximum - minimum + 1)
+        return rarity, fish_name, weight
 
     @staticmethod
     def _checkin_success_reply(reservation: CheckinReservation) -> str:
@@ -2296,6 +2315,8 @@ class FapiPlugin(Star):
         operation: GameOperation,
         tokenrouter_user_id: int,
     ) -> str:
+        if operation.game_type == "fishing":
+            return ""
         timestamp = self._format_ledger_time(operation.created_at)
         is_debit = operation.debit_user_id == tokenrouter_user_id
         is_credit = operation.credit_user_id == tokenrouter_user_id
@@ -2335,7 +2356,8 @@ class FapiPlugin(Star):
             sign = ""
         else:
             amount = self._format_units(units)
-        return f"{timestamp} 打劫{role} {sign}{amount}（{status}）"
+        label = "转账" if operation.game_type == "transfer" else "打劫"
+        return f"{timestamp} {label}{role} {sign}{amount}（{status}）"
 
     async def _incomplete_tasks_reply(self, limit: int) -> str:
         reward_jobs, game_operations = await asyncio.gather(

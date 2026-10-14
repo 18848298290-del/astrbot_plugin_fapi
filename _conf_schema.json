@@ -180,31 +180,29 @@
     "default": 300,
     "slider": {"min": 0, "max": 86400, "step": 1}
   },
+  "fishing_enabled": {
+    "description": "启用娱乐钓鱼",
+    "type": "bool",
+    "hint": "钓鱼只记录娱乐鱼获，不会变动 TokenRouter 余额。",
+    "default": true
+  },
+  "fishing_cooldown_seconds": {
+    "description": "钓鱼冷却秒数",
+    "type": "int",
+    "default": 120,
+    "slider": {"min": 0, "max": 86400, "step": 1}
+  },
+  "transfer_max_amount": {
+    "description": "单次转账上限",
+    "type": "string",
+    "hint": "群成员之间单次余额转移的最高金额，最多支持 8 位小数。",
+    "default": "1000.00"
+  },
   "reward_timezone": {
     "description": "奖励日期时区",
     "type": "string",
     "hint": "用于签到日期和每日预算统计，例如 Asia/Shanghai。",
     "default": "Asia/Shanghai"
-  },
-  "invitation_threshold": {
-    "description": "邀请奖励人数门槛",
-    "type": "int",
-    "hint": "同一群每累计这么多名有效留存的新成员，给邀请人发放一次邀请奖励。",
-    "default": 5,
-    "slider": {"min": 1, "max": 100, "step": 1}
-  },
-  "invitation_reward": {
-    "description": "邀请奖励金额",
-    "type": "string",
-    "hint": "每达到一次邀请人数门槛发放的 TokenRouter 余额。默认 USD 0.50。",
-    "default": "0.50"
-  },
-  "invitation_maturity_hours": {
-    "description": "邀请有效留存小时数",
-    "type": "int",
-    "hint": "新成员加入后持续留存达到此时长才计入邀请奖励，默认 24 小时。",
-    "default": 24,
-    "slider": {"min": 0, "max": 720, "step": 1}
   },
   "daily_broadcast_enabled": {
     "description": "启用每日群播报",
@@ -254,16 +252,6 @@
     "type": "string",
     "hint": "插件启动时自动创建，用于防止多实例向同一群重复发送每日播报。",
     "default": "astrbot_fapi_daily_broadcasts"
-  },
-  "mysql_invitations_table": {
-    "description": "邀请事件表名",
-    "type": "string",
-    "default": "astrbot_fapi_invitations"
-  },
-  "mysql_invitation_stats_table": {
-    "description": "邀请统计表名",
-    "type": "string",
-    "default": "astrbot_fapi_invitation_stats"
   },
   "mysql_game_operations_table": {
     "description": "游戏结算记录表名",

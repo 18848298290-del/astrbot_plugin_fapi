@@ -1018,78 +1018,6 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/fapi 绑定\n", replies[0])
         self.assertIn("红包创建：仅 AstrBot 管理员", replies[0])
 
-    async def test_invitation_event_fails_closed_without_allowed_group(self):
-        class Rewards:
-            async def record_invitation_event(_self, **_values):
-                raise AssertionError("未配置指定群时不得记录邀请")
-
-        self.plugin._allowed_group_id = ""
-        self.plugin.rewards = Rewards()
-        replies = await collect(
-            self.plugin.on_qq_official_event(
-                FakeEvent(
-                    platform_name="qq_official",
-                    raw_message={
-                        "t": "GROUP_MEMBER_ADD",
-                        "d": {
-                            "group_openid": "group-1",
-                            "member_openid": "member-2",
-                            "op_member_openid": "member-1",
-                        },
-                    },
-                )
-            )
-        )
-        self.assertEqual(replies, [])
-
-    async def test_invitation_event_announces_new_member_and_leave_invalidates(self):
-        calls = []
-
-        class Rewards:
-            async def record_invitation_event(_self, **values):
-                calls.append(("add", values))
-                return True
-
-            async def invalidate_invitation_event(_self, **values):
-                calls.append(("remove", values))
-                return True
-
-        self.plugin.rewards = Rewards()
-        add_replies = await collect(
-            self.plugin.on_qq_official_event(
-                FakeEvent(
-                    platform_name="qq_official",
-                    raw_message={
-                        "t": "GROUP_MEMBER_ADD",
-                        "d": {
-                            "group_openid": "987654321",
-                            "member_openid": "member-2",
-                            "member_name": "李四",
-                            "op_member_openid": "member-1",
-                            "op_member_name": "张三",
-                        },
-                    },
-                )
-            )
-        )
-        await collect(
-            self.plugin.on_qq_official_event(
-                FakeEvent(
-                    platform_name="qq_official",
-                    raw_message={
-                        "t": "GROUP_MEMBER_REMOVE",
-                        "d": {
-                            "group_openid": "987654321",
-                            "member_openid": "member-2",
-                        },
-                    },
-                )
-            )
-        )
-        self.assertIn("张三 邀请了 李四", add_replies[0])
-        self.assertEqual(calls[0][0], "add")
-        self.assertEqual(calls[1][0], "remove")
-
     async def test_help_menu_is_rejected_outside_configured_group(self):
         replies = await collect(
             self.plugin.help_menu(FakeEvent(group_id="another-group"))
@@ -1458,6 +1386,66 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(
             self.plugin._mentioned_target_id(multiple_targets, command_context)
         )
+
+    async def test_fishing_records_a_non_financial_operation(self):
+        games = InMemoryGameStore(self.module)
+        self.plugin.bindings = GameBindings({"12345": 11})
+        self.plugin.games = games
+
+        replies = await collect(self.plugin.fishing(FakeEvent()))
+
+        self.assertEqual(len(replies), 1)
+        self.assertIn("钓鱼成功", replies[0])
+        self.assertIn("不会变动余额", replies[0])
+        self.assertEqual(games.reserve_calls[0]["game_type"], "fishing")
+        self.assertEqual(games.reserve_calls[0]["debit_units"], 0)
+        self.assertEqual(games.reserve_calls[0]["credit_units"], 0)
+
+    async def test_fishing_requires_a_bound_account(self):
+        games = InMemoryGameStore(self.module)
+        self.plugin.bindings = GameBindings({})
+        self.plugin.games = games
+
+        replies = await collect(self.plugin.fishing(FakeEvent()))
+
+        self.assertEqual(replies, ["当前账号尚未绑定 TokenRouter 账户，请先使用 /fapi 绑定。"])
+        self.assertEqual(games.reserve_calls, [])
+
+    async def test_transfer_moves_balance_between_bound_users(self):
+        event = FakeEvent(messages=[SimpleNamespace(type="At", qq="67890")])
+        games = InMemoryGameStore(self.module)
+        client = BalanceClient(self.module)
+        self.plugin.bindings = GameBindings({"12345": 11, "67890": 22})
+        self.plugin.games = games
+        self.plugin.client = client
+
+        replies = await collect(self.plugin.transfer(event, "2.50"))
+
+        self.assertEqual(len(replies), 1)
+        self.assertIn("转账成功", replies[0])
+        self.assertEqual(games.reserve_calls[0]["game_type"], "transfer")
+        self.assertEqual(games.reserve_calls[0]["debit_units"], 250_000_000)
+        self.assertEqual(
+            [(call["user_id"], call["operation"]) for call in client.calls],
+            [(11, "subtract"), (22, "add")],
+        )
+
+    async def test_transfer_rejects_invalid_target_before_balance_access(self):
+        event = FakeEvent(messages=[SimpleNamespace(type="At", qq="12345")])
+        games = InMemoryGameStore(self.module)
+        self.plugin.games = games
+
+        replies = await collect(self.plugin.transfer(event, "1"))
+
+        self.assertEqual(replies, ["请只 @ 一名其他群成员：/fapi 转账 @用户 <金额>"])
+        self.assertEqual(games.reserve_calls, [])
+
+    def test_fishing_result_is_deterministic(self):
+        first = self.plugin._fishing_catch("fapi-game:v1:fishing:example")
+        second = self.plugin._fishing_catch("fapi-game:v1:fishing:example")
+
+        self.assertEqual(first, second)
+        self.assertGreater(first[2], 0)
 
     async def test_robbery_success_transfers_between_bound_users_once(self):
         event = FakeEvent(

@@ -1,4 +1,4 @@
-## 4.1.2\n\n- Subscribe directly to QQ Official group member add/remove callbacks and send invitation notices through the group session.\n\n# 更新记录
+## 4.1.4\n\n- 新增娱乐钓鱼和具备幂等扣款、入账及退款处理的群成员余额转账。\n\n## 4.1.3\n\n- 移除 QQ 官方机器人邀请奖励、邀请排行及成员邀请事件订阅；保留历史邀请表，不再创建、读取或写入。\n\n## 4.1.2\n\n- Subscribe directly to QQ Official group member add/remove callbacks and send invitation notices through the group session.\n\n# 更新记录
 
 ## 4.1.1
 
