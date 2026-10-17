@@ -98,7 +98,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和打劫",
-    "4.1.6",
+    "4.1.7",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -744,13 +744,12 @@ class FapiPlugin(Star):
 
         if command_context.platform == "qq_official":
             binding_usage = "/fapi 绑定 <完整邮箱>"
-            red_packet_permission = "红包创建：仅 AstrBot 管理员"
         else:
             binding_usage = (
                 "/fapi 绑定\n"
                 "/fapi 绑定 <完整邮箱>"
             )
-            red_packet_permission = "红包创建：群主、群管理员或 AstrBot 管理员"
+        red_packet_permission = "红包创建：已绑定用户，余额充足时可创建"
 
         yield event.plain_result(
             "FAPI 功能菜单\n"
@@ -1062,7 +1061,7 @@ class FapiPlugin(Star):
         amount: str = "",
         count: int = 0,
     ):
-        """由群管理创建平台余额红包。"""
+        """由已绑定用户使用自身余额创建群红包。"""
         command_context, context_error = self._group_command_context(event)
         if context_error:
             yield event.plain_result(context_error)
@@ -1070,17 +1069,6 @@ class FapiPlugin(Star):
         assert command_context is not None
         qq_id = command_context.sender_id
         group_id = command_context.group_id
-        if not await self._can_create_red_packet(
-            event,
-            command_context.platform,
-            group_id,
-            qq_id,
-        ):
-            if command_context.platform == "qq_official":
-                yield event.plain_result("QQ 官方机器人仅允许 AstrBot 管理员创建红包。")
-            else:
-                yield event.plain_result("只有群主、群管理员或机器人管理员可以创建红包。")
-            return
         if self._reward_config_error:
             yield event.plain_result("奖励配置不正确，请联系管理员检查插件配置。")
             return
@@ -1119,6 +1107,22 @@ class FapiPlugin(Star):
             if creation_key is None:
                 yield event.plain_result("无法确认当前消息编号，为避免重复创建红包，本次操作已取消。")
                 return
+            binding = await self.bindings.get_by_qq(qq_id)
+            if binding is None:
+                yield event.plain_result(
+                    "当前账号尚未绑定 TokenRouter 账户，请先使用 /fapi 绑定。"
+                )
+                return
+            await self.client.adjust_balance(
+                user_id=binding.tokenrouter_user_id,
+                amount=units_to_decimal(total_units),
+                operation="subtract",
+                idempotency_key=f"{creation_key}:debit",
+                notes=(
+                    f"FAPI user-funded red packet group={group_id} "
+                    f"creation={creation_key}"
+                ),
+            )
             packet = await self.rewards.create_red_packet(
                 creation_key=creation_key,
                 group_id=group_id,
@@ -1129,12 +1133,54 @@ class FapiPlugin(Star):
                 daily_budget_units=self._red_packet_daily_budget_units,
                 expires_at=expires_at,
             )
+        except BindingDatabaseError as exc:
+            logger.error("FAPI 查询红包创建者绑定关系失败：%s", exc)
+            yield event.plain_result("远程绑定数据库暂时不可用，请稍后重试。")
+            return
+        except TokenRouterError as exc:
+            logger.warning(
+                "FAPI 创建红包扣款失败：creator=%s, amount_units=%s, "
+                "status=%s, code=%s, unknown=%s, error=%s",
+                qq_id,
+                total_units,
+                exc.status_code,
+                exc.api_code,
+                exc.outcome_unknown,
+                exc,
+            )
+            if is_insufficient_balance_error(exc):
+                yield event.plain_result("余额不足，无法创建红包。")
+            elif exc.outcome_unknown:
+                yield event.plain_result(
+                    "红包扣款结果暂时无法确认，请使用同一条消息稍后重试。"
+                )
+            else:
+                yield event.plain_result("红包扣款失败，请稍后重试。")
+            return
         except RewardBudgetExhausted:
-            yield event.plain_result("今天的平台红包预算不足，无法创建。")
+            refunded = await self._refund_red_packet_creation(
+                binding.tokenrouter_user_id,
+                total_units,
+                creation_key,
+            )
+            yield event.plain_result(
+                "今天的红包创建额度已用完，金额已退回余额。"
+                if refunded
+                else "今天的红包创建额度已用完，退款处理中，请稍后查询余额。"
+            )
             return
         except RewardDatabaseError as exc:
             logger.error("FAPI 创建群红包失败：%s", exc)
-            yield event.plain_result("红包数据库暂时不可用，请稍后重试。")
+            refunded = await self._refund_red_packet_creation(
+                binding.tokenrouter_user_id,
+                total_units,
+                creation_key,
+            )
+            yield event.plain_result(
+                "红包创建失败，金额已退回余额。"
+                if refunded
+                else "红包创建失败，退款处理中，请稍后查询余额。"
+            )
             return
 
         yield event.plain_result(
@@ -2375,47 +2421,34 @@ class FapiPlugin(Star):
             )
         )
 
-    @staticmethod
-    async def _can_create_red_packet(
-        event: AstrMessageEvent,
-        platform: str,
-        group_id: str,
-        sender_id: str,
+    async def _refund_red_packet_creation(
+        self,
+        tokenrouter_user_id: int,
+        total_units: int,
+        creation_key: str,
     ) -> bool:
-        is_admin = getattr(event, "is_admin", None)
         try:
-            if callable(is_admin) and is_admin():
-                return True
-        except Exception:
-            pass
-
-        if platform != "aiocqhttp":
-            return False
-
-        message_obj = getattr(event, "message_obj", None)
-        raw = getattr(message_obj, "raw_message", None)
-        sender = raw.get("sender", {}) if isinstance(raw, dict) else {}
-        role = str(sender.get("role", "")).strip().casefold()
-        if role in {"owner", "admin"}:
+            await self.client.adjust_balance(
+                user_id=tokenrouter_user_id,
+                amount=units_to_decimal(total_units),
+                operation="add",
+                idempotency_key=f"{creation_key}:refund",
+                notes=f"FAPI red packet creation refund creation={creation_key}",
+            )
             return True
-        if role == "member":
-            return False
-
-        get_group = getattr(event, "get_group", None)
-        if not callable(get_group):
-            return False
-        try:
-            group = await get_group(group_id)
+        except TokenRouterError as exc:
+            logger.error(
+                "FAPI 红包创建退款失败：user=%s, amount_units=%s, "
+                "status=%s, code=%s, error=%s",
+                tokenrouter_user_id,
+                total_units,
+                exc.status_code,
+                exc.api_code,
+                exc,
+            )
         except Exception:
-            return False
-        if group is None:
-            return False
-        owner_id = str(getattr(group, "group_owner", "") or "")
-        admin_ids = {
-            str(value)
-            for value in (getattr(group, "group_admins", None) or [])
-        }
-        return sender_id == owner_id or sender_id in admin_ids
+            logger.exception("FAPI 红包创建退款出现未预期错误")
+        return False
 
     @staticmethod
     def _red_packet_creation_key(

@@ -999,7 +999,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/fapi 打劫 @用户", replies[0])
         self.assertNotIn("老虎机", replies[0])
         self.assertFalse(hasattr(self.plugin, "slot_machine"))
-        self.assertIn("群主、群管理员或 AstrBot 管理员", replies[0])
+        self.assertIn("红包创建：已绑定用户，余额充足时可创建", replies[0])
 
     async def test_official_help_menu_requires_email_and_astrbot_admin(self):
         self.plugin._allowed_group_id = "official-group-openid"
@@ -1016,7 +1016,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(replies), 1)
         self.assertIn("/fapi 绑定 <完整邮箱>", replies[0])
         self.assertNotIn("/fapi 绑定\n", replies[0])
-        self.assertIn("红包创建：仅 AstrBot 管理员", replies[0])
+        self.assertIn("红包创建：已绑定用户，余额充足时可创建", replies[0])
 
     async def test_help_menu_is_rejected_outside_configured_group(self):
         replies = await collect(
@@ -2231,12 +2231,13 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0], ("attempt", "op-retry"))
         self.assertEqual(calls[1], ("error", "op-retry", "处理中", 31))
 
-    async def test_regular_group_member_cannot_create_red_packet(self):
+    async def test_unbound_group_member_cannot_create_red_packet(self):
         class Rewards:
             async def create_red_packet(_self, **_values):
-                raise AssertionError("普通群员不能创建平台红包")
+                raise AssertionError("未绑定用户不得创建红包")
 
         self.plugin.rewards = Rewards()
+        self.plugin.bindings = GameBindings({})
         replies = await collect(
             self.plugin.create_red_packet(
                 FakeEvent(group_id="987654321", role="member"),
@@ -2247,10 +2248,10 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             replies,
-            ["只有群主、群管理员或机器人管理员可以创建红包。"],
+            ["当前账号尚未绑定 TokenRouter 账户，请先使用 /fapi 绑定。"],
         )
 
-    async def test_group_admin_can_create_red_packet(self):
+    async def test_bound_group_member_creates_red_packet_after_balance_debit(self):
         class Rewards:
             async def create_red_packet(_self, **values):
                 self.assertEqual(values["group_id"], "987654321")
@@ -2263,45 +2264,71 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.plugin.rewards = Rewards()
+        self.plugin.bindings = GameBindings({"12345": 11})
+        client = BalanceClient(self.module)
+        self.plugin.client = client
         replies = await collect(
             self.plugin.create_red_packet(
-                FakeEvent(group_id="987654321", role="admin"),
+                FakeEvent(group_id="987654321", role="member"),
                 "1.00",
                 2,
             )
         )
 
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["user_id"], 11)
+        self.assertEqual(client.calls[0]["amount"], Decimal("1"))
+        self.assertEqual(client.calls[0]["operation"], "subtract")
+        self.assertTrue(client.calls[0]["idempotency_key"].endswith(":debit"))
         self.assertIn("群红包 #9 已创建", replies[0])
         self.assertIn("总金额：USD 1.00", replies[0])
         self.assertIn("领取指令：/fapi 抢红包 9", replies[0])
         self.assertNotIn("抢红包 领取", replies[0])
 
-    async def test_official_group_role_does_not_bypass_astrbot_admin_check(self):
+    async def test_red_packet_creation_rejects_insufficient_creator_balance(self):
         class Rewards:
             async def create_red_packet(_self, **_values):
-                raise AssertionError("官机群角色不可作为红包创建权限")
+                raise AssertionError("余额不足时不得写入红包")
 
-        self.plugin._allowed_group_id = "official-group-openid"
         self.plugin.rewards = Rewards()
+        self.plugin.bindings = GameBindings({"12345": 11})
+        self.plugin.client = BalanceClient(self.module, fail_on=1)
         replies = await collect(
             self.plugin.create_red_packet(
-                FakeEvent(
-                    sender_id="official-member-openid",
-                    platform_name="qq_official",
-                    group_id="official-group-openid",
-                    role="admin",
-                ),
+                FakeEvent(group_id="987654321", role="member"),
+                "1.00",
+                2,
+            )
+        )
+
+        self.assertEqual(replies, ["余额不足，无法创建红包。"])
+
+    async def test_red_packet_creation_refunds_after_database_failure(self):
+        class Rewards:
+            async def create_red_packet(_self, **_values):
+                raise self.module.RewardDatabaseError("database unavailable")
+
+        self.plugin.rewards = Rewards()
+        self.plugin.bindings = GameBindings({"12345": 11})
+        client = BalanceClient(self.module)
+        self.plugin.client = client
+
+        replies = await collect(
+            self.plugin.create_red_packet(
+                FakeEvent(group_id="987654321", role="member"),
                 "1.00",
                 2,
             )
         )
 
         self.assertEqual(
-            replies,
-            ["QQ 官方机器人仅允许 AstrBot 管理员创建红包。"],
+            [(call["operation"], call["user_id"]) for call in client.calls],
+            [("subtract", 11), ("add", 11)],
         )
+        self.assertTrue(client.calls[1]["idempotency_key"].endswith(":refund"))
+        self.assertEqual(replies, ["红包创建失败，金额已退回余额。"])
 
-    async def test_astrbot_admin_can_create_red_packet_in_official_group(self):
+    async def test_bound_official_group_member_can_create_red_packet(self):
         class Rewards:
             async def create_red_packet(_self, **values):
                 self.assertEqual(values["group_id"], "official-group-openid")
@@ -2317,6 +2344,8 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
 
         self.plugin._allowed_group_id = "official-group-openid"
         self.plugin.rewards = Rewards()
+        self.plugin.bindings = GameBindings({"official-member-openid": 11})
+        self.plugin.client = BalanceClient(self.module)
         replies = await collect(
             self.plugin.create_red_packet(
                 FakeEvent(
@@ -2324,7 +2353,6 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
                     platform_name="qq_official",
                     group_id="official-group-openid",
                     role=None,
-                    astrbot_admin=True,
                 ),
                 "1.00",
                 2,

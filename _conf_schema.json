@@ -122,9 +122,9 @@
     "default": "20.00"
   },
   "red_packet_daily_budget": {
-    "description": "红包每日总预算",
+    "description": "红包每日总创建额度",
     "type": "string",
-    "hint": "创建红包时一次性预留全部金额；未领取金额也计入当天预算。",
+    "hint": "按奖励时区统计，创建时一次性预留全部金额；未领取金额也计入当天额度。",
     "default": "100.00"
   },
   "red_packet_max_count": {
