@@ -98,7 +98,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和打劫",
-    "4.1.7",
+    "4.1.8",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -749,7 +749,7 @@ class FapiPlugin(Star):
                 "/fapi 绑定\n"
                 "/fapi 绑定 <完整邮箱>"
             )
-        red_packet_permission = "红包创建：已绑定用户，余额充足时可创建"
+        official_website = "官网:https://www.f-api.site"
 
         yield event.plain_result(
             "FAPI 功能菜单\n"
@@ -766,7 +766,7 @@ class FapiPlugin(Star):
             "/fapi 打劫 @用户\n"
             "/fapi 转账 @用户 <金额>\n"
             "/fapi 帮助\n\n"
-            f"{red_packet_permission}"
+            f"{official_website}"
         )
 
     @fapi.command("绑定", alias={"bind"})

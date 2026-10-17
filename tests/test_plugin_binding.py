@@ -999,9 +999,9 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/fapi 打劫 @用户", replies[0])
         self.assertNotIn("老虎机", replies[0])
         self.assertFalse(hasattr(self.plugin, "slot_machine"))
-        self.assertIn("红包创建：已绑定用户，余额充足时可创建", replies[0])
+        self.assertIn("官网:https://www.f-api.site", replies[0])
 
-    async def test_official_help_menu_requires_email_and_astrbot_admin(self):
+    async def test_official_help_menu_requires_email_and_shows_website(self):
         self.plugin._allowed_group_id = "official-group-openid"
         replies = await collect(
             self.plugin.help_menu(
@@ -1016,7 +1016,7 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(replies), 1)
         self.assertIn("/fapi 绑定 <完整邮箱>", replies[0])
         self.assertNotIn("/fapi 绑定\n", replies[0])
-        self.assertIn("红包创建：已绑定用户，余额充足时可创建", replies[0])
+        self.assertIn("官网:https://www.f-api.site", replies[0])
 
     async def test_help_menu_is_rejected_outside_configured_group(self):
         replies = await collect(
