@@ -582,6 +582,45 @@ class RewardReportingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("status = 'succeeded'", cursor.sql)
         self.assertEqual(cursor.params, ("checkin",))
 
+    async def test_admin_packet_detail_counts_succeeded_claims(self):
+        class Cursor:
+            def __init__(self):
+                self.sql = ""
+                self.params = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def execute(self, sql, params=None):
+                self.sql = sql
+                self.params = params
+
+            async def fetchone(self):
+                return {
+                    "id": 9,
+                    "group_id": "group-1",
+                    "creator_qq_id": "member-1",
+                    "total_units": 100_000_000,
+                    "remaining_units": 40_000_000,
+                    "total_count": 3,
+                    "remaining_count": 1,
+                    "status": "closed",
+                    "expires_at": datetime(2026, 10, 18, 0, 0),
+                    "credited_count": 2,
+                }
+
+        cursor = Cursor()
+        packet = await self.store_with_cursor(cursor).get_red_packet_admin(9)
+
+        self.assertIsNotNone(packet)
+        self.assertEqual(packet.credited_count, 2)
+        self.assertEqual(cursor.params, (9,))
+        self.assertIn("SUM(j.status = 'succeeded')", cursor.sql)
+        self.assertIn("LEFT JOIN", cursor.sql)
+
     async def test_reward_retry_only_updates_existing_pending_job(self):
         class Cursor:
             rowcount = 1

@@ -402,6 +402,60 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("红包列表", replies[0])
         self.assertIn("#9 open USD 1.00 / 剩余 USD 0.40 / 1 份", replies[0])
 
+    async def test_private_admin_packet_detail_shows_credited_claims(self):
+        class Rewards:
+            async def get_red_packet_admin(_self, packet_id):
+                self.assertEqual(packet_id, 9)
+                return SimpleNamespace(
+                    packet_id=9,
+                    status="closed",
+                    creator_qq_id="12345",
+                    group_id="987654321",
+                    total_units=100_000_000,
+                    remaining_units=40_000_000,
+                    remaining_count=1,
+                    credited_count=2,
+                    expires_at=self.module.datetime(2026, 10, 18, 0, 0),
+                )
+
+        self.plugin.rewards = Rewards()
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=True),
+                "红包详情 9",
+            )
+        )
+
+        self.assertIn("已到账：2 份", replies[0])
+
+    async def test_private_admin_keeps_legacy_ledger_alias(self):
+        class Client:
+            async def find_users_by_exact_email(_self, email):
+                self.assertEqual(email, "alice@example.com")
+                return [user(7, "alice", "alice@example.com")]
+
+        class Rewards:
+            async def get_user_ledger(_self, user_id, **_values):
+                self.assertEqual(user_id, 7)
+                return []
+
+        class Games:
+            async def get_user_operations(_self, user_id, **_values):
+                self.assertEqual(user_id, 7)
+                return []
+
+        self.plugin.client = Client()
+        self.plugin.rewards = Rewards()
+        self.plugin.games = Games()
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=True),
+                "流水 alice@example.com",
+            )
+        )
+
+        self.assertIn("插件账单：alice@example.com", replies[0])
+
     async def test_private_admin_refunds_red_packet_with_fixed_key(self):
         packet = SimpleNamespace(
             packet_id=9,

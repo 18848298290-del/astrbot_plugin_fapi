@@ -637,9 +637,16 @@ class MySQLRewardStore:
     async def get_red_packet_admin(self, packet_id: int) -> RedPacketRecord | None:
         await self.initialize()
         sql = f"""
-            SELECT id, group_id, creator_qq_id, total_units, remaining_units,
-                   total_count, remaining_count, status, expires_at, 0 AS credited_count
-            FROM `{self.packets_table}` WHERE id = %s LIMIT 1
+            SELECT p.id, p.group_id, p.creator_qq_id,
+                   p.total_units, p.remaining_units,
+                   p.total_count, p.remaining_count, p.status, p.expires_at,
+                   COALESCE(SUM(j.status = 'succeeded'), 0) AS credited_count
+            FROM `{self.packets_table}` p
+            LEFT JOIN `{self.claims_table}` c ON c.packet_id = p.id
+            LEFT JOIN `{self.jobs_table}` j ON j.operation_id = c.operation_id
+            WHERE p.id = %s
+            GROUP BY p.id
+            LIMIT 1
         """
         try:
             async with self._pool.acquire() as connection:
