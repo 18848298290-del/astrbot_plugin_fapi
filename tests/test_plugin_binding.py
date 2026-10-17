@@ -374,6 +374,97 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/fapi 管理 排行 [数量]", replies[0])
         self.assertIn("/fapi 管理 查询 <邮箱>", replies[0])
         self.assertIn("USD 1,000.00", replies[0])
+        self.assertIn("/fapi 管理 红包列表 [数量]", replies[0])
+        self.assertIn("/fapi 管理 封禁 <邮箱>", replies[0])
+
+    async def test_private_admin_lists_red_packets(self):
+        class Rewards:
+            async def list_red_packets(_self, limit):
+                self.assertEqual(limit, 2)
+                return [
+                    SimpleNamespace(
+                        packet_id=9,
+                        status="open",
+                        total_units=100_000_000,
+                        remaining_units=40_000_000,
+                        remaining_count=1,
+                    )
+                ]
+
+        self.plugin.rewards = Rewards()
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=True),
+                "红包列表 2",
+            )
+        )
+
+        self.assertIn("红包列表", replies[0])
+        self.assertIn("#9 open USD 1.00 / 剩余 USD 0.40 / 1 份", replies[0])
+
+    async def test_private_admin_refunds_red_packet_with_fixed_key(self):
+        packet = SimpleNamespace(
+            packet_id=9,
+            creator_qq_id="12345",
+            remaining_units=40_000_000,
+        )
+
+        class Rewards:
+            async def reserve_red_packet_refund(_self, packet_id):
+                self.assertEqual(packet_id, 9)
+                return packet
+
+            async def mark_red_packet_refunded(_self, packet_id):
+                self.assertEqual(packet_id, 9)
+                return True
+
+        class Bindings:
+            async def get_by_qq_for_admin(_self, qq_id):
+                self.assertEqual(qq_id, "12345")
+                return SimpleNamespace(tokenrouter_user_id=7)
+
+        class Client:
+            async def adjust_balance(_self, **values):
+                self.assertEqual(values["user_id"], 7)
+                self.assertEqual(values["operation"], "add")
+                self.assertEqual(values["amount"], Decimal("0.4"))
+                self.assertEqual(
+                    values["idempotency_key"], "fapi-red-packet-refund:v1:9"
+                )
+
+        self.plugin.rewards = Rewards()
+        self.plugin.bindings = Bindings()
+        self.plugin.client = Client()
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=True),
+                "红包退款 9",
+            )
+        )
+
+        self.assertEqual(replies, ["红包 #9 已退款给创建者：USD 0.40。"])
+
+    async def test_private_admin_blocks_bound_user(self):
+        class Client:
+            async def find_users_by_exact_email(_self, email):
+                self.assertEqual(email, "alice@example.com")
+                return [user(7, "alice", "alice@example.com")]
+
+        class Bindings:
+            async def set_user_blocked(_self, user_id, blocked):
+                self.assertEqual((user_id, blocked), (7, True))
+                return True
+
+        self.plugin.client = Client()
+        self.plugin.bindings = Bindings()
+        replies = await collect(
+            self.plugin.admin_private(
+                FakeEvent(group_id=None, astrbot_admin=True),
+                "封禁 alice@example.com",
+            )
+        )
+
+        self.assertEqual(replies, ["已封禁：alice@example.com（ID 7）"])
 
     async def test_private_admin_rejects_regular_user_before_external_access(self):
         class ForbiddenClient:

@@ -39,6 +39,7 @@ class BindingRecord:
     qq_id: str
     tokenrouter_user_id: int
     email: str
+    blocked: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,8 +174,8 @@ class MySQLBindingStore:
     async def get_by_qq(self, qq_id: str) -> BindingRecord | None:
         await self.initialize()
         sql = (
-            f"SELECT qq_id, tokenrouter_user_id, email FROM `{self.table}` "
-            "WHERE qq_id = %s LIMIT 1"
+            f"SELECT qq_id, tokenrouter_user_id, email, blocked_at FROM `{self.table}` "
+            "WHERE qq_id = %s AND blocked_at IS NULL LIMIT 1"
         )
         try:
             async with self._pool.acquire() as connection:
@@ -184,6 +185,53 @@ class MySQLBindingStore:
         except Exception as exc:
             raise BindingDatabaseError("读取远程 MySQL 失败") from exc
         return _row_to_binding(row) if row else None
+
+    async def get_by_qq_for_admin(self, qq_id: str) -> BindingRecord | None:
+        await self.initialize()
+        sql = (
+            f"SELECT qq_id, tokenrouter_user_id, email, blocked_at FROM `{self.table}` "
+            "WHERE qq_id = %s LIMIT 1"
+        )
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql, (qq_id,))
+                    row = await cursor.fetchone()
+        except Exception as exc:
+            raise BindingDatabaseError("查询管理员绑定关系失败") from exc
+        return _row_to_binding(row) if row else None
+
+    async def set_user_blocked(self, tokenrouter_user_id: int, blocked: bool) -> bool:
+        await self.initialize()
+        sql = (
+            f"UPDATE `{self.table}` SET blocked_at = "
+            "CASE WHEN %s THEN UTC_TIMESTAMP(6) ELSE NULL END "
+            "WHERE tokenrouter_user_id = %s"
+        )
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql, (int(blocked), tokenrouter_user_id))
+                    return cursor.rowcount == 1
+        except Exception as exc:
+            raise BindingDatabaseError("更新用户封禁状态失败") from exc
+
+    async def list_blocked(self, limit: int = 20) -> list[BindingRecord]:
+        await self.initialize()
+        safe_limit = max(1, min(int(limit), 50))
+        sql = f"""
+            SELECT qq_id, tokenrouter_user_id, email, blocked_at
+            FROM `{self.table}` WHERE blocked_at IS NOT NULL
+            ORDER BY blocked_at DESC LIMIT {safe_limit}
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql)
+                    rows = await cursor.fetchall()
+        except Exception as exc:
+            raise BindingDatabaseError("查询封禁用户失败") from exc
+        return [_row_to_binding(row) for row in rows]
 
     async def get_by_user_ids(
         self,
@@ -195,7 +243,7 @@ class MySQLBindingStore:
             return {}
         placeholders = ", ".join("%s" for _ in normalized)
         sql = (
-            f"SELECT qq_id, tokenrouter_user_id, email FROM `{self.table}` "
+            f"SELECT qq_id, tokenrouter_user_id, email, blocked_at FROM `{self.table}` "
             f"WHERE tokenrouter_user_id IN ({placeholders})"
         )
         try:
@@ -292,6 +340,7 @@ class MySQLBindingStore:
                     COLLATE utf8mb4_bin NOT NULL,
                 tokenrouter_user_id BIGINT UNSIGNED NOT NULL,
                 email VARCHAR(254) NOT NULL,
+                blocked_at DATETIME(6) NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                     ON UPDATE CURRENT_TIMESTAMP,
@@ -315,6 +364,7 @@ class MySQLBindingStore:
             async with connection.cursor() as cursor:
                 await cursor.execute(sql)
                 await self._ensure_platform_id_column(cursor)
+                await self._ensure_blocked_column(cursor)
                 await cursor.execute(cooldown_sql)
             await connection.commit()
 
@@ -344,6 +394,20 @@ class MySQLBindingStore:
             "VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL"
         )
 
+    async def _ensure_blocked_column(self, cursor: Any) -> None:
+        await cursor.execute(
+            """
+            SELECT 1 FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s
+              AND COLUMN_NAME = 'blocked_at' LIMIT 1
+            """,
+            (self.table,),
+        )
+        if await cursor.fetchone() is None:
+            await cursor.execute(
+                f"ALTER TABLE `{self.table}` ADD COLUMN blocked_at DATETIME(6) NULL"
+            )
+
     def _validate_config(self) -> None:
         if not self.host or not self.user or not self.database:
             raise BindingDatabaseError("远程 MySQL 配置不完整")
@@ -371,6 +435,7 @@ def _row_to_binding(row: dict[str, Any]) -> BindingRecord:
         qq_id=str(row["qq_id"]),
         tokenrouter_user_id=int(row["tokenrouter_user_id"]),
         email=str(row["email"]),
+        blocked=row.get("blocked_at") is not None,
     )
 
 

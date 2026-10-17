@@ -673,6 +673,19 @@ class MySQLGameStore:
             raise GameDatabaseError("unable to read user game operations") from exc
         return [_row_to_operation(row) for row in rows]
 
+    async def list_recent_operations(self, limit: int = 20) -> list[GameOperation]:
+        await self.initialize()
+        safe_limit = max(1, min(int(limit), 50))
+        sql = f"SELECT * FROM `{self.table}` ORDER BY created_at DESC LIMIT {safe_limit}"
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql)
+                    rows = await cursor.fetchall()
+        except Exception as exc:
+            raise GameDatabaseError("unable to read recent game operations") from exc
+        return [_row_to_operation(row) for row in rows]
+
     async def list_pending(self, limit: int = 20) -> list[GameOperation]:
         await self.initialize()
         safe_limit = max(1, min(int(limit), 100))

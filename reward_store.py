@@ -76,6 +76,7 @@ class RedPacketRecord:
     total_count: int
     remaining_count: int
     expires_at: datetime
+    status: str = "open"
     created: bool = True
     credited_count: int = 0
 
@@ -575,7 +576,7 @@ class MySQLRewardStore:
         sql = f"""
             SELECT p.id, p.group_id, p.creator_qq_id,
                    p.total_units, p.remaining_units,
-                   p.total_count, p.remaining_count, p.expires_at,
+                   p.total_count, p.remaining_count, p.status, p.expires_at,
                    COALESCE(SUM(j.status = 'succeeded'), 0) AS credited_count
             FROM `{self.packets_table}` p
             LEFT JOIN `{self.claims_table}` c ON c.packet_id = p.id
@@ -593,6 +594,106 @@ class MySQLRewardStore:
         except Exception as exc:
             raise RewardDatabaseError("查询红包状态失败") from exc
         return _row_to_packet(row) if row else None
+
+    async def list_red_packets(self, limit: int = 20) -> list[RedPacketRecord]:
+        await self.initialize()
+        safe_limit = max(1, min(int(limit), 50))
+        sql = f"""
+            SELECT p.id, p.group_id, p.creator_qq_id,
+                   p.total_units, p.remaining_units,
+                   p.total_count, p.remaining_count, p.status, p.expires_at,
+                   COALESCE(SUM(j.status = 'succeeded'), 0) AS credited_count
+            FROM `{self.packets_table}` p
+            LEFT JOIN `{self.claims_table}` c ON c.packet_id = p.id
+            LEFT JOIN `{self.jobs_table}` j ON j.operation_id = c.operation_id
+            GROUP BY p.id
+            ORDER BY p.id DESC LIMIT {safe_limit}
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql)
+                    rows = await cursor.fetchall()
+        except Exception as exc:
+            raise RewardDatabaseError("查询红包列表失败") from exc
+        return [_row_to_packet(row) for row in rows]
+
+    async def close_red_packet(self, packet_id: int) -> RedPacketRecord | None:
+        await self.initialize()
+        sql = f"""
+            UPDATE `{self.packets_table}` SET status = 'closed'
+            WHERE id = %s AND status = 'open'
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql, (packet_id,))
+                    changed = cursor.rowcount == 1
+            packet = await self.get_red_packet_admin(packet_id)
+        except Exception as exc:
+            raise RewardDatabaseError("关闭红包失败") from exc
+        return packet if changed else None
+
+    async def get_red_packet_admin(self, packet_id: int) -> RedPacketRecord | None:
+        await self.initialize()
+        sql = f"""
+            SELECT id, group_id, creator_qq_id, total_units, remaining_units,
+                   total_count, remaining_count, status, expires_at, 0 AS credited_count
+            FROM `{self.packets_table}` WHERE id = %s LIMIT 1
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql, (packet_id,))
+                    row = await cursor.fetchone()
+        except Exception as exc:
+            raise RewardDatabaseError("查询红包详情失败") from exc
+        return _row_to_packet(row) if row else None
+
+    async def reserve_red_packet_refund(self, packet_id: int) -> RedPacketRecord | None:
+        await self.initialize()
+        async with self._pool.acquire() as connection:
+            await connection.begin()
+            try:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        f"SELECT * FROM `{self.packets_table}` WHERE id = %s FOR UPDATE",
+                        (packet_id,),
+                    )
+                    row = await cursor.fetchone()
+                    if row is None or int(row["remaining_units"]) <= 0:
+                        await connection.rollback()
+                        return None
+                    if row["status"] == "refunded":
+                        await connection.rollback()
+                        return None
+                    if row["status"] != "refund_pending":
+                        await cursor.execute(
+                            f"UPDATE `{self.packets_table}` SET status = 'refund_pending' WHERE id = %s",
+                            (packet_id,),
+                        )
+                    await connection.commit()
+                    row["status"] = "refund_pending"
+                    row["credited_count"] = 0
+                    return _row_to_packet(row)
+            except Exception as exc:
+                await connection.rollback()
+                raise RewardDatabaseError("预留红包退款失败") from exc
+
+    async def mark_red_packet_refunded(self, packet_id: int) -> bool:
+        await self.initialize()
+        sql = f"""
+            UPDATE `{self.packets_table}`
+            SET status = 'refunded', remaining_units = 0, remaining_count = 0
+            WHERE id = %s AND status = 'refund_pending'
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql, (packet_id,))
+                    return cursor.rowcount == 1
+        except Exception as exc:
+            raise RewardDatabaseError("确认红包退款失败") from exc
 
     async def get_reward_job(self, operation_id: str) -> RewardJob | None:
         await self.initialize()
@@ -715,6 +816,31 @@ class MySQLRewardStore:
                     rows = await cursor.fetchall()
         except Exception as exc:
             raise RewardDatabaseError("读取用户奖励账单失败") from exc
+        return [
+            RewardLedgerEntry(
+                operation_id=str(row["operation_id"]),
+                source_type=str(row["source_type"]),
+                amount_units=int(row["amount_units"]),
+                status=RewardJobStatus(str(row["status"])),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    async def list_recent_ledger(self, limit: int = 20) -> list[RewardLedgerEntry]:
+        await self.initialize()
+        safe_limit = max(1, min(int(limit), 50))
+        sql = f"""
+            SELECT operation_id, source_type, amount_units, status, created_at
+            FROM `{self.jobs_table}` ORDER BY created_at DESC LIMIT {safe_limit}
+        """
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(sql)
+                    rows = await cursor.fetchall()
+        except Exception as exc:
+            raise RewardDatabaseError("读取全局奖励流水失败") from exc
         return [
             RewardLedgerEntry(
                 operation_id=str(row["operation_id"]),
@@ -1219,7 +1345,7 @@ class MySQLRewardStore:
         sql = f"""
             SELECT id AS packet_id, group_id, creator_qq_id,
                    total_units, remaining_units, total_count,
-                   remaining_count, expires_at, 0 AS credited_count
+                   remaining_count, status, expires_at, 0 AS credited_count
             FROM `{self.packets_table}`
             WHERE creation_key = %s LIMIT 1
         """
@@ -1366,6 +1492,7 @@ def _row_to_packet(row: dict[str, Any]) -> RedPacketRecord:
         total_count=int(row["total_count"]),
         remaining_count=int(row["remaining_count"]),
         expires_at=row["expires_at"],
+        status=str(row.get("status", "open")),
         created=False,
         credited_count=int(row.get("credited_count", 0)),
     )

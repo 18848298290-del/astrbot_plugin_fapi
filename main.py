@@ -98,7 +98,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和打劫",
-    "4.1.8",
+    "4.1.9",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -393,6 +393,14 @@ class FapiPlugin(Star):
                 "/fapi 管理 状态 <邮箱>\n"
                 "/fapi 管理 查询 <邮箱>（状态的别名）\n"
                 "/fapi 管理 账单 <邮箱>\n"
+                "/fapi 管理 全局流水 [数量]\n"
+                "/fapi 管理 红包列表 [数量]\n"
+                "/fapi 管理 红包详情 <编号>\n"
+                "/fapi 管理 关闭红包 <编号>\n"
+                "/fapi 管理 红包退款 <编号>\n"
+                "/fapi 管理 封禁 <邮箱>\n"
+                "/fapi 管理 解封 <邮箱>\n"
+                "/fapi 管理 封禁列表 [数量]\n"
                 "/fapi 管理 未完成任务 [数量]\n"
                 "/fapi 管理 重试 <任务编号>\n"
                 "/fapi 管理 加余额 <邮箱> <金额>\n"
@@ -420,8 +428,17 @@ class FapiPlugin(Star):
             "query": "query",
             "user": "query",
             "账单": "ledger",
-            "流水": "ledger",
             "bill": "ledger",
+            "全局流水": "activity",
+            "流水": "activity",
+            "activity": "activity",
+            "红包列表": "packet_list",
+            "红包详情": "packet_detail",
+            "关闭红包": "packet_close",
+            "红包退款": "packet_refund",
+            "封禁": "block",
+            "解封": "unblock",
+            "封禁列表": "blocked",
             "未完成任务": "incomplete",
             "任务": "incomplete",
             "tasks": "incomplete",
@@ -442,9 +459,12 @@ class FapiPlugin(Star):
 
         email = ""
         amount = ""
-        if operation in {"query", "rpm", "ledger", "retry"}:
+        if operation in {
+            "query", "rpm", "ledger", "retry", "block", "unblock",
+            "packet_detail", "packet_close", "packet_refund",
+        }:
             email = arguments
-        elif operation in {"ranking", "incomplete"}:
+        elif operation in {"ranking", "incomplete", "activity", "packet_list", "blocked"}:
             email = arguments
         elif operation in {"add", "subtract"}:
             email, separator, amount = arguments.rpartition(" ")
@@ -508,6 +528,80 @@ class FapiPlugin(Star):
                 yield event.plain_result("任务数据库暂时不可用，请稍后重试。")
                 return
             yield event.plain_result(retry_reply)
+            return
+
+        if operation in {"activity", "packet_list", "blocked"}:
+            raw_limit = email.strip()
+            try:
+                list_limit = 10 if not raw_limit else int(raw_limit)
+            except ValueError:
+                list_limit = 0
+            if not 1 <= list_limit <= 20:
+                yield event.plain_result("数量必须是 1 到 20 的整数。")
+                return
+            try:
+                if operation == "activity":
+                    reply = await self._global_activity_reply(list_limit)
+                elif operation == "packet_list":
+                    reply = await self._admin_packet_list_reply(list_limit)
+                else:
+                    reply = await self._blocked_users_reply(list_limit)
+            except (BindingDatabaseError, RewardDatabaseError, GameDatabaseError) as exc:
+                logger.error("FAPI 管理员读取后台列表失败：%s", exc)
+                yield event.plain_result("后台数据暂时不可用，请稍后重试。")
+                return
+            yield event.plain_result(reply)
+            return
+
+        if operation in {"packet_detail", "packet_close", "packet_refund"}:
+            try:
+                packet_id = int(email.strip())
+            except ValueError:
+                packet_id = 0
+            if packet_id <= 0:
+                yield event.plain_result("红包编号必须是正整数。")
+                return
+            try:
+                if operation == "packet_detail":
+                    packet = await self.rewards.get_red_packet_admin(packet_id)
+                    reply = self._admin_packet_reply(packet) if packet else "未找到该红包。"
+                elif operation == "packet_close":
+                    packet = await self.rewards.close_red_packet(packet_id)
+                    reply = (
+                        f"红包 #{packet_id} 已关闭，剩余 {self._format_units(packet.remaining_units)}。"
+                        if packet else "红包不存在或当前不可关闭。"
+                    )
+                else:
+                    reply = await self._refund_packet(packet_id)
+            except (BindingDatabaseError, RewardDatabaseError) as exc:
+                logger.error("FAPI 管理员处理红包失败：%s", exc)
+                yield event.plain_result("红包管理数据暂时不可用，请稍后重试。")
+                return
+            yield event.plain_result(reply)
+            return
+
+        if operation in {"block", "unblock"}:
+            user, user_error = await self._resolve_private_admin_user(email)
+            if user_error:
+                yield event.plain_result(user_error)
+                return
+            assert user is not None
+            try:
+                changed = await self.bindings.set_user_blocked(
+                    user.user_id,
+                    operation == "block",
+                )
+            except BindingDatabaseError as exc:
+                logger.error("FAPI 管理员更新用户封禁状态失败：%s", exc)
+                yield event.plain_result("封禁数据暂时不可用，请稍后重试。")
+                return
+            if not changed:
+                yield event.plain_result("该用户尚未绑定插件账号。")
+                return
+            yield event.plain_result(
+                f"已{'封禁' if operation == 'block' else '解封'}："
+                f"{self._safe_reply_field(user.email)}（ID {user.user_id}）"
+            )
             return
 
         if operation == "ranking":
@@ -2303,6 +2397,102 @@ class FapiPlugin(Star):
             amount = self._format_units(units)
         label = "转账" if operation.game_type == "transfer" else "打劫"
         return f"{timestamp} {label}{role} {sign}{amount}（{status}）"
+
+    def _admin_packet_reply(self, packet) -> str:
+        return (
+            f"红包 #{packet.packet_id}\n"
+            f"状态：{self._safe_reply_field(packet.status)}\n"
+            f"创建者：{self._safe_reply_field(packet.creator_qq_id)}\n"
+            f"群：{self._safe_reply_field(packet.group_id)}\n"
+            f"总额：{self._format_units(packet.total_units)}\n"
+            f"剩余：{self._format_units(packet.remaining_units)} / "
+            f"{packet.remaining_count} 份\n"
+            f"已到账：{packet.credited_count} 份\n"
+            f"到期：{self._format_ledger_time(packet.expires_at)}"
+        )
+
+    async def _admin_packet_list_reply(self, limit: int) -> str:
+        packets = await self.rewards.list_red_packets(limit)
+        if not packets:
+            return "红包列表\n暂无红包记录。"
+        lines = ["红包列表"]
+        for packet in packets:
+            lines.append(
+                f"#{packet.packet_id} {packet.status} "
+                f"{self._format_units(packet.total_units)} / 剩余 "
+                f"{self._format_units(packet.remaining_units)} / "
+                f"{packet.remaining_count} 份"
+            )
+        return "\n".join(lines)
+
+    async def _global_activity_reply(self, limit: int) -> str:
+        reward_entries, game_entries = await asyncio.gather(
+            self.rewards.list_recent_ledger(limit),
+            self.games.list_recent_operations(limit),
+        )
+        rows: list[tuple[float, str]] = []
+        for entry in reward_entries:
+            rows.append(
+                (
+                    self._datetime_sort_key(entry.created_at),
+                    f"{self._format_ledger_time(entry.created_at)} 奖励 "
+                    f"{entry.source_type} +{self._format_units(entry.amount_units)} "
+                    f"({entry.status.value})",
+                )
+            )
+        for operation in game_entries:
+            units = operation.debit_units or operation.credit_units
+            rows.append(
+                (
+                    self._datetime_sort_key(operation.created_at),
+                    f"{self._format_ledger_time(operation.created_at)} 游戏 "
+                    f"{operation.game_type} {self._format_units(units)} "
+                    f"({operation.status.value})",
+                )
+            )
+        rows.sort(key=lambda item: item[0], reverse=True)
+        if not rows:
+            return "全局流水\n暂无插件流水。"
+        return "\n".join(["全局流水", *(text for _, text in rows[:limit])])
+
+    async def _blocked_users_reply(self, limit: int) -> str:
+        bindings = await self.bindings.list_blocked(limit)
+        if not bindings:
+            return "封禁列表\n当前没有被封禁的绑定用户。"
+        lines = ["封禁列表"]
+        lines.extend(
+            f"{self._mask_email(binding.email)}（ID {binding.tokenrouter_user_id}）"
+            for binding in bindings
+        )
+        return "\n".join(lines)
+
+    async def _refund_packet(self, packet_id: int) -> str:
+        packet = await self.rewards.reserve_red_packet_refund(packet_id)
+        if packet is None:
+            return "红包不存在、没有可退余额，或已经完成退款。"
+        binding = await self.bindings.get_by_qq_for_admin(packet.creator_qq_id)
+        if binding is None:
+            return "创建者绑定记录不存在，红包退款已保留待人工处理。"
+        try:
+            await self.client.adjust_balance(
+                user_id=binding.tokenrouter_user_id,
+                amount=units_to_decimal(packet.remaining_units),
+                operation="add",
+                idempotency_key=f"fapi-red-packet-refund:v1:{packet.packet_id}",
+                notes=f"FAPI admin red packet refund packet={packet.packet_id}",
+            )
+        except TokenRouterError as exc:
+            logger.warning(
+                "FAPI 管理员红包退款失败：packet=%s, status=%s, code=%s, error=%s",
+                packet.packet_id, exc.status_code, exc.api_code, exc,
+            )
+            return "红包退款结果暂未确认，已保留退款状态，可重试该命令。"
+        if not await self.rewards.mark_red_packet_refunded(packet.packet_id):
+            return "红包退款已入账，本地状态等待下一次重试确认。"
+        return (
+            f"红包 #{packet.packet_id} 已退款给创建者："
+            f"{self._format_units(packet.remaining_units)}。"
+        )
 
     async def _incomplete_tasks_reply(self, limit: int) -> str:
         reward_jobs, game_operations = await asyncio.gather(
