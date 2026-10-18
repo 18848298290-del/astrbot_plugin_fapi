@@ -1677,6 +1677,49 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
             [(11, "subtract")],
         )
 
+    async def test_scratch_card_ledger_shows_cost_prize_and_net_gain(self):
+        operation = game_operation(
+            self.module,
+            game_type="scratch_card",
+            target_qq_id=None,
+            target_user_id=None,
+            debit_user_id=11,
+            credit_user_id=11,
+            debit_units=10_000_000,
+            credit_units=30_000_000,
+        )
+
+        line = self.plugin._game_ledger_line(operation, 11)
+
+        self.assertIn("刮刮乐净收益 +USD 0.20", line)
+        self.assertIn("成本 USD 0.10，奖金 USD 0.30", line)
+
+    async def test_global_activity_shows_scratch_card_cost_prize_and_net_gain(self):
+        operation = game_operation(
+            self.module,
+            game_type="scratch_card",
+            target_qq_id=None,
+            target_user_id=None,
+            debit_user_id=11,
+            credit_user_id=11,
+            debit_units=10_000_000,
+            credit_units=30_000_000,
+        )
+
+        class Rewards:
+            async def list_recent_ledger(_self, _limit):
+                return []
+
+        class Games:
+            async def list_recent_operations(_self, _limit):
+                return [operation]
+
+        self.plugin.rewards = Rewards()
+        self.plugin.games = Games()
+        reply = await self.plugin._global_activity_reply(10)
+
+        self.assertIn("刮刮乐 成本 USD 0.10 / 奖金 USD 0.30 / 净 +USD 0.20", reply)
+
     async def test_robbery_backfire_transfers_actor_balance_to_target(self):
         event = FakeEvent(
             messages=[SimpleNamespace(type="At", qq="67890")],

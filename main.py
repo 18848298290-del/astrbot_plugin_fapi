@@ -98,7 +98,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和打劫",
-    "4.2.0",
+    "4.2.1",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -2491,6 +2491,8 @@ class FapiPlugin(Star):
         is_credit = operation.credit_user_id == tokenrouter_user_id
         if not is_debit and not is_credit:
             return ""
+        if operation.game_type == "scratch_card" and is_debit and is_credit:
+            return self._scratch_card_ledger_line(timestamp, operation)
         role = "支出" if is_debit else "收入"
         units = operation.debit_units if is_debit else operation.credit_units
         sign = "-" if is_debit else "+"
@@ -2532,6 +2534,47 @@ class FapiPlugin(Star):
         }
         label = labels.get(operation.game_type, "游戏")
         return f"{timestamp} {label}{role} {sign}{amount}（{status}）"
+
+    @staticmethod
+    def _scratch_card_ledger_line(
+        timestamp: str,
+        operation: GameOperation,
+    ) -> str:
+        cost = FapiPlugin._format_units(operation.debit_units)
+        prize = FapiPlugin._format_units(operation.credit_units)
+        if operation.status == GameStatus.SUCCEEDED:
+            if not operation.won:
+                return f"{timestamp} 刮刮乐支出 -{cost}（未中奖）"
+            net_units = operation.credit_units - operation.debit_units
+            if net_units > 0:
+                role = "净收益"
+                sign = "+"
+            elif net_units < 0:
+                role = "净支出"
+                sign = "-"
+            else:
+                role = "持平"
+                sign = ""
+            return (
+                f"{timestamp} 刮刮乐{role} "
+                f"{sign}{FapiPlugin._format_units(abs(net_units))}"
+                f"（成本 {cost}，奖金 {prize}，已完成）"
+            )
+        if operation.status == GameStatus.PENDING_DEBIT:
+            return f"{timestamp} 刮刮乐成本 -{cost}（待扣款）"
+        if operation.status == GameStatus.PENDING_CREDIT:
+            return f"{timestamp} 刮刮乐成本 -{cost}（已扣款，待派奖 {prize}）"
+        if operation.status == GameStatus.PENDING_REFUND:
+            return f"{timestamp} 刮刮乐成本 -{cost}（派奖失败，退款中）"
+        if operation.status == GameStatus.MANUAL_REVIEW:
+            return f"{timestamp} 刮刮乐成本 -{cost}（派奖失败，退款待人工处理）"
+        if operation.status == GameStatus.REFUNDED:
+            return f"{timestamp} 刮刮乐成本 {FapiPlugin._format_units(0)}（已退款）"
+        if operation.status == GameStatus.INSUFFICIENT:
+            return f"{timestamp} 刮刮乐成本 {FapiPlugin._format_units(0)}（余额不足，未变动）"
+        if operation.status == GameStatus.FAILED:
+            return f"{timestamp} 刮刮乐成本 {FapiPlugin._format_units(0)}（失败，未变动）"
+        return f"{timestamp} 刮刮乐状态未知"
 
     def _admin_packet_reply(self, packet) -> str:
         return (
@@ -2576,13 +2619,33 @@ class FapiPlugin(Star):
                 )
             )
         for operation in game_entries:
-            units = operation.debit_units or operation.credit_units
+            if operation.game_type == "scratch_card":
+                cost = self._format_units(operation.debit_units)
+                prize = self._format_units(operation.credit_units)
+                if operation.status == GameStatus.SUCCEEDED:
+                    net_units = operation.credit_units - operation.debit_units
+                    sign = "+" if net_units > 0 else "-" if net_units < 0 else ""
+                    detail = (
+                        f"成本 {cost} / 奖金 {prize} / 净 "
+                        f"{sign}{self._format_units(abs(net_units))}"
+                    )
+                else:
+                    detail = f"成本 {cost} / 奖金 {prize}"
+                text = (
+                    f"{self._format_ledger_time(operation.created_at)} 游戏 刮刮乐 "
+                    f"{detail} ({operation.status.value})"
+                )
+            else:
+                units = operation.debit_units or operation.credit_units
+                text = (
+                    f"{self._format_ledger_time(operation.created_at)} 游戏 "
+                    f"{operation.game_type} {self._format_units(units)} "
+                    f"({operation.status.value})"
+                )
             rows.append(
                 (
                     self._datetime_sort_key(operation.created_at),
-                    f"{self._format_ledger_time(operation.created_at)} 游戏 "
-                    f"{operation.game_type} {self._format_units(units)} "
-                    f"({operation.status.value})",
+                    text,
                 )
             )
         rows.sort(key=lambda item: item[0], reverse=True)
