@@ -209,6 +209,18 @@
     "default": 60,
     "slider": {"min": 0, "max": 86400, "step": 1}
   },
+  "group_entertainment_start_time": {
+    "description": "群娱乐每日开放时间",
+    "type": "string",
+    "hint": "使用 reward_timezone 时区的 HH:MM 格式。与关闭时间相同时表示全天开放；支持跨天，例如 22:00 至 02:00。",
+    "default": "00:00"
+  },
+  "group_entertainment_end_time": {
+    "description": "群娱乐每日关闭时间",
+    "type": "string",
+    "hint": "到达该时间后关闭创建红包、抢红包、打劫和刮刮乐；使用 reward_timezone 时区的 HH:MM 格式。",
+    "default": "00:00"
+  },
   "transfer_max_amount": {
     "description": "单次转账上限",
     "type": "string",

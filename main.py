@@ -98,7 +98,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和打劫",
-    "4.2.1",
+    "4.3.0",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -255,6 +255,21 @@ class FapiPlugin(Star):
             self._reward_timezone = timezone.utc
             self._reward_timezone_error = str(exc)
             self._reward_config_error = str(exc)
+
+        self._entertainment_schedule_error = ""
+        try:
+            self._entertainment_start_minute = self._parse_daily_minute(
+                config.get("group_entertainment_start_time", "00:00")
+            )
+            self._entertainment_end_minute = self._parse_daily_minute(
+                config.get("group_entertainment_end_time", "00:00")
+            )
+        except (TypeError, ValueError):
+            self._entertainment_start_minute = 0
+            self._entertainment_end_minute = 0
+            self._entertainment_schedule_error = (
+                "群娱乐开放和关闭时间必须使用 HH:MM 格式"
+            )
 
         try:
             self._checkin_reward_min_units = money_to_units(
@@ -1194,6 +1209,10 @@ class FapiPlugin(Star):
         assert command_context is not None
         qq_id = command_context.sender_id
         group_id = command_context.group_id
+        entertainment_error = self._entertainment_access_error()
+        if entertainment_error:
+            yield event.plain_result(entertainment_error)
+            return
         if self._reward_config_error:
             yield event.plain_result("奖励配置不正确，请联系管理员检查插件配置。")
             return
@@ -1330,6 +1349,10 @@ class FapiPlugin(Star):
         assert command_context is not None
         qq_id = command_context.sender_id
         group_id = command_context.group_id
+        entertainment_error = self._entertainment_access_error()
+        if entertainment_error:
+            yield event.plain_result(entertainment_error)
+            return
         parsed_packet_id = self._parse_optional_packet_id(packet_id)
         if parsed_packet_id is None:
             yield event.plain_result("红包编号不正确。")
@@ -1423,6 +1446,10 @@ class FapiPlugin(Star):
             yield event.plain_result(context_error)
             return
         assert command_context is not None
+        entertainment_error = self._entertainment_access_error()
+        if entertainment_error:
+            yield event.plain_result(entertainment_error)
+            return
         if self._game_config_error:
             yield event.plain_result("游戏配置不正确，请联系管理员检查插件配置。")
             return
@@ -1521,6 +1548,10 @@ class FapiPlugin(Star):
             yield event.plain_result(context_error)
             return
         assert command_context is not None
+        entertainment_error = self._entertainment_access_error()
+        if entertainment_error:
+            yield event.plain_result(entertainment_error)
+            return
         if self._scratch_card_config_error:
             yield event.plain_result("刮刮乐配置不正确，请联系管理员检查插件配置。")
             return
@@ -2055,9 +2086,9 @@ class FapiPlugin(Star):
         freshness = "（统计可能延迟）" if overview.stats_stale else ""
         return (
             f"FAPI 每日播报 {stats.reward_date.isoformat()}{freshness}\n"
-            f"全站请求：{overview.today_requests:,}\n"
-            f"全站 Token：{overview.today_tokens:,}\n"
-            f"全站消费：{FapiPlugin._format_usd(overview.today_actual_cost)}\n"
+            f"全站请求：{overview.today_requests * 2:,}\n"
+            f"全站 Token：{overview.today_tokens * 2:,}\n"
+            f"全站消费：{FapiPlugin._format_usd(overview.today_actual_cost * 2)}\n"
             f"签到：{stats.checkin_count:,} 人 / "
             f"{FapiPlugin._format_units(stats.checkin_units)}\n"
             f"红包：创建 {stats.red_packet_count:,} 个 / "
@@ -2795,6 +2826,46 @@ class FapiPlugin(Star):
             return None, "无法识别当前 QQ 用户，请稍后重试。"
 
         return GroupCommandContext(platform, sender_id, group_id), None
+
+    @staticmethod
+    def _parse_daily_minute(value: object) -> int:
+        text = str(value).strip()
+        if len(text) != 5 or text[2] != ":":
+            raise ValueError("invalid daily time")
+        hour, minute = (int(part) for part in text.split(":"))
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            raise ValueError("invalid daily time")
+        return hour * 60 + minute
+
+    def _entertainment_access_error(self, now: datetime | None = None) -> str | None:
+        if self._entertainment_schedule_error:
+            return f"群娱乐时段配置无效：{self._entertainment_schedule_error}。"
+        if self._entertainment_start_minute == self._entertainment_end_minute:
+            return None
+        local_now = (now or datetime.now(self._reward_timezone)).astimezone(
+            self._reward_timezone
+        )
+        current_minute = local_now.hour * 60 + local_now.minute
+        if self._entertainment_start_minute < self._entertainment_end_minute:
+            is_open = (
+                self._entertainment_start_minute
+                <= current_minute
+                < self._entertainment_end_minute
+            )
+        else:
+            is_open = (
+                current_minute >= self._entertainment_start_minute
+                or current_minute < self._entertainment_end_minute
+            )
+        if is_open:
+            return None
+        start_hour, start_minute = divmod(self._entertainment_start_minute, 60)
+        end_hour, end_minute = divmod(self._entertainment_end_minute, 60)
+        return (
+            "群娱乐功能当前已关闭，开放时间为每天 "
+            f"{start_hour:02d}:{start_minute:02d} 至 {end_hour:02d}:{end_minute:02d}"
+            f"（{self._reward_timezone}）。"
+        )
 
     @staticmethod
     def _valid_platform_identifier(value: str) -> bool:

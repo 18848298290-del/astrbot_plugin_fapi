@@ -2881,8 +2881,60 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         reply = self.plugin._daily_broadcast_reply(overview, stats)
 
         self.assertIn("FAPI 每日播报 2026-10-12", reply)
+        self.assertIn("全站请求：24", reply)
+        self.assertIn("全站 Token：690", reply)
+        self.assertIn("全站消费：USD 2.50", reply)
         self.assertIn("签到：3 人", reply)
         self.assertIn("红包到账：2 份", reply)
+
+    async def test_entertainment_schedule_honors_regular_and_overnight_windows(self):
+        regular = self.module.FapiPlugin(
+            object(),
+            {
+                "allowed_group_id": "987654321",
+                "group_entertainment_start_time": "09:00",
+                "group_entertainment_end_time": "22:00",
+            },
+        )
+        overnight = self.module.FapiPlugin(
+            object(),
+            {
+                "allowed_group_id": "987654321",
+                "group_entertainment_start_time": "22:00",
+                "group_entertainment_end_time": "02:00",
+            },
+        )
+        await regular.client.close()
+        await overnight.client.close()
+        zone = self.module.ZoneInfo("Asia/Shanghai")
+
+        self.assertIsNone(
+            regular._entertainment_access_error(
+                self.module.datetime(2026, 10, 18, 9, 0, tzinfo=zone)
+            )
+        )
+        self.assertIn(
+            "09:00 至 22:00",
+            regular._entertainment_access_error(
+                self.module.datetime(2026, 10, 18, 22, 0, tzinfo=zone)
+            ),
+        )
+        self.assertIsNone(
+            overnight._entertainment_access_error(
+                self.module.datetime(2026, 10, 18, 23, 0, tzinfo=zone)
+            )
+        )
+        self.assertIsNone(
+            overnight._entertainment_access_error(
+                self.module.datetime(2026, 10, 19, 1, 59, tzinfo=zone)
+            )
+        )
+        self.assertIn(
+            "22:00 至 02:00",
+            overnight._entertainment_access_error(
+                self.module.datetime(2026, 10, 19, 2, 0, tzinfo=zone)
+            ),
+        )
 
     async def test_daily_broadcast_sends_only_after_database_claim(self):
         sent = []
