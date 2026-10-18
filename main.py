@@ -98,7 +98,7 @@ class PrivateAdminContext:
     "astrbot_plugin_fapi",
     "FAPI",
     "QQ 与 TokenRouter 账号互通、签到、群红包和打劫",
-    "4.1.9",
+    "4.2.0",
 )
 class FapiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -325,6 +325,36 @@ class FapiPlugin(Star):
                 raise ValueError("打劫冷却时间必须在 0 到 86400 秒之间")
         except ValueError as exc:
             self._game_config_error = str(exc)
+
+        self._scratch_card_config_error = ""
+        try:
+            self._scratch_card_enabled = bool(config.get("scratch_card_enabled", True))
+            self._scratch_card_cost_units = money_to_units(
+                config.get("scratch_card_cost", "0.10")
+            )
+            self._scratch_card_win_rate = int(
+                config.get("scratch_card_win_rate", 25)
+            )
+            self._scratch_card_prize_units = money_to_units(
+                config.get("scratch_card_prize", "0.30")
+            )
+            self._scratch_card_cooldown_seconds = int(
+                config.get("scratch_card_cooldown_seconds", 60)
+            )
+            if self._scratch_card_cost_units <= 0:
+                raise ValueError("刮刮乐成本必须大于 0")
+            if self._scratch_card_prize_units <= 0:
+                raise ValueError("刮刮乐奖金必须大于 0")
+            if not 0 <= self._scratch_card_win_rate <= 100:
+                raise ValueError("刮刮乐中奖率必须在 0 到 100 之间")
+            if not 0 <= self._scratch_card_cooldown_seconds <= 86400:
+                raise ValueError("刮刮乐冷却时间必须在 0 到 86400 秒之间")
+        except ValueError as exc:
+            self._scratch_card_config_error = str(exc)
+            self._scratch_card_cost_units = 0
+            self._scratch_card_prize_units = 0
+            self._scratch_card_win_rate = 0
+            self._scratch_card_cooldown_seconds = 0
 
         self._transfer_config_error = ""
         try:
@@ -858,6 +888,7 @@ class FapiPlugin(Star):
             "/fapi 红包排行\n"
             "/fapi 账单\n"
             "/fapi 打劫 @用户\n"
+            "/fapi 刮刮乐\n"
             "/fapi 转账 @用户 <金额>\n"
             "/fapi 帮助\n\n"
             f"{official_website}"
@@ -1482,6 +1513,81 @@ class FapiPlugin(Star):
         settled = await self._settle_game_operation(operation)
         yield event.plain_result(self._game_reply(settled))
 
+    @fapi.command("刮刮乐", alias={"scratch"})
+    async def scratch_card(self, event: AstrMessageEvent):
+        """支付固定成本后按配置概率获得固定奖金。"""
+        command_context, context_error = self._group_command_context(event)
+        if context_error:
+            yield event.plain_result(context_error)
+            return
+        assert command_context is not None
+        if self._scratch_card_config_error:
+            yield event.plain_result("刮刮乐配置不正确，请联系管理员检查插件配置。")
+            return
+        if not self._scratch_card_enabled:
+            yield event.plain_result("刮刮乐功能当前未开启。")
+            return
+        operation_key = self._game_operation_key(
+            event,
+            command_context,
+            "scratch_card",
+        )
+        if operation_key is None:
+            yield event.plain_result(
+                "无法确认当前消息编号，为避免重复扣款，本次刮刮乐已取消。"
+            )
+            return
+
+        early_reply = ""
+        try:
+            async with self._game_command_lock:
+                operation = await self.games.get_by_key(operation_key)
+                if operation is None:
+                    binding = await self.bindings.get_by_qq(command_context.sender_id)
+                    if binding is None:
+                        early_reply = (
+                            "当前账号尚未绑定 TokenRouter 账户，请先使用 /fapi 绑定。"
+                        )
+                    else:
+                        won = roll_success(self._scratch_card_win_rate)
+                        reservation = await self.games.reserve_game(
+                            operation_key=operation_key,
+                            game_type="scratch_card",
+                            group_id=command_context.group_id,
+                            actor_qq_id=command_context.sender_id,
+                            actor_user_id=binding.tokenrouter_user_id,
+                            debit_user_id=binding.tokenrouter_user_id,
+                            credit_user_id=(
+                                binding.tokenrouter_user_id if won else None
+                            ),
+                            debit_units=self._scratch_card_cost_units,
+                            credit_units=(
+                                self._scratch_card_prize_units if won else 0
+                            ),
+                            won=won,
+                            cooldown_seconds=self._scratch_card_cooldown_seconds,
+                        )
+                        operation = reservation.operation
+        except GameCooldownActive as exc:
+            yield event.plain_result(
+                f"刮刮乐冷却中，请在 {exc.retry_after_seconds} 秒后再试。"
+            )
+            return
+        except BindingDatabaseError as exc:
+            logger.error("FAPI 查询刮刮乐绑定关系失败：%s", exc)
+            yield event.plain_result("远程绑定数据库暂时不可用，请稍后重试。")
+            return
+        except (GameDatabaseError, GameOperationConflict) as exc:
+            logger.error("FAPI 预留刮刮乐操作失败：%s", exc)
+            yield event.plain_result("刮刮乐数据暂时不可用，请稍后重试。")
+            return
+
+        if early_reply:
+            yield event.plain_result(early_reply)
+            return
+        settled = await self._settle_game_operation(operation)
+        yield event.plain_result(self._game_reply(settled))
+
     @fapi.command("转账", alias={"transfer", "转余额"})
     async def transfer(
         self,
@@ -2078,6 +2184,30 @@ class FapiPlugin(Star):
                 )
             return "打劫失败，本次没有余额变动。"
 
+        if operation.game_type == "scratch_card":
+            if operation.status in pending:
+                return "刮刮乐结果已锁定，余额正在结算，请稍后查询。"
+            if operation.status == GameStatus.MANUAL_REVIEW:
+                return "刮刮乐派奖异常，退款需要管理员人工处理。"
+            if operation.status == GameStatus.INSUFFICIENT:
+                return "余额不足，本次刮刮乐未发生余额变动。"
+            if operation.status == GameStatus.REFUNDED:
+                return "刮刮乐派奖失败，扣除的成本已退回你的账户。"
+            if operation.status == GameStatus.FAILED:
+                return "刮刮乐扣款失败，本次未发生余额变动。"
+            if operation.status == GameStatus.SUCCEEDED and operation.won:
+                return (
+                    "刮刮乐中奖\n"
+                    f"成本：{FapiPlugin._format_units(operation.debit_units)}\n"
+                    f"奖金：{FapiPlugin._format_units(operation.credit_units)}"
+                )
+            if operation.status == GameStatus.SUCCEEDED:
+                return (
+                    "刮刮乐未中奖\n"
+                    f"成本：{FapiPlugin._format_units(operation.debit_units)}"
+                )
+            return "刮刮乐状态无法识别，请稍后查询账单。"
+
         return "游戏结算状态不可识别。"
 
     @staticmethod
@@ -2395,7 +2525,12 @@ class FapiPlugin(Star):
             sign = ""
         else:
             amount = self._format_units(units)
-        label = "转账" if operation.game_type == "transfer" else "打劫"
+        labels = {
+            "transfer": "转账",
+            "robbery": "打劫",
+            "scratch_card": "刮刮乐",
+        }
+        label = labels.get(operation.game_type, "游戏")
         return f"{timestamp} {label}{role} {sign}{amount}（{status}）"
 
     def _admin_packet_reply(self, packet) -> str:

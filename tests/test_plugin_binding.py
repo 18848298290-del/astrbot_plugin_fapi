@@ -1628,6 +1628,55 @@ class PluginBindingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(games.reserve_calls[0]["debit_units"], 0)
         self.assertEqual(games.reserve_calls[0]["credit_units"], 0)
 
+    async def test_scratch_card_winner_pays_cost_and_receives_prize_once(self):
+        event = FakeEvent(message_id="scratch-card-winner")
+        games = InMemoryGameStore(self.module)
+        client = BalanceClient(self.module)
+        self.plugin.bindings = GameBindings({"12345": 11})
+        self.plugin.games = games
+        self.plugin.client = client
+        self.module.roll_success = lambda _rate: True
+
+        first_reply = await collect(self.plugin.scratch_card(event))
+        second_reply = await collect(self.plugin.scratch_card(event))
+
+        self.assertEqual(first_reply, second_reply)
+        self.assertEqual(
+            first_reply,
+            ["刮刮乐中奖\n成本：USD 0.10\n奖金：USD 0.30"],
+        )
+        self.assertEqual(len(games.reserve_calls), 1)
+        reservation = games.reserve_calls[0]
+        self.assertEqual(reservation["game_type"], "scratch_card")
+        self.assertEqual(reservation["debit_user_id"], 11)
+        self.assertEqual(reservation["credit_user_id"], 11)
+        self.assertEqual(reservation["debit_units"], 10_000_000)
+        self.assertEqual(reservation["credit_units"], 30_000_000)
+        self.assertEqual(
+            [(call["user_id"], call["operation"]) for call in client.calls],
+            [(11, "subtract"), (11, "add")],
+        )
+
+    async def test_scratch_card_loss_only_debits_cost(self):
+        games = InMemoryGameStore(self.module)
+        client = BalanceClient(self.module)
+        self.plugin.bindings = GameBindings({"12345": 11})
+        self.plugin.games = games
+        self.plugin.client = client
+        self.module.roll_success = lambda _rate: False
+
+        replies = await collect(self.plugin.scratch_card(FakeEvent()))
+
+        self.assertEqual(replies, ["刮刮乐未中奖\n成本：USD 0.10"])
+        reservation = games.reserve_calls[0]
+        self.assertFalse(reservation["won"])
+        self.assertIsNone(reservation["credit_user_id"])
+        self.assertEqual(reservation["credit_units"], 0)
+        self.assertEqual(
+            [(call["user_id"], call["operation"]) for call in client.calls],
+            [(11, "subtract")],
+        )
+
     async def test_robbery_backfire_transfers_actor_balance_to_target(self):
         event = FakeEvent(
             messages=[SimpleNamespace(type="At", qq="67890")],

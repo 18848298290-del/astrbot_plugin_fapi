@@ -180,6 +180,35 @@
     "default": 300,
     "slider": {"min": 0, "max": 86400, "step": 1}
   },
+  "scratch_card_enabled": {
+    "description": "启用刮刮乐",
+    "type": "bool",
+    "default": true
+  },
+  "scratch_card_cost": {
+    "description": "每次刮刮乐成本",
+    "type": "string",
+    "hint": "每次参与时从用户余额原子扣除的金额。",
+    "default": "0.10"
+  },
+  "scratch_card_win_rate": {
+    "description": "刮刮乐中奖率（百分比）",
+    "type": "int",
+    "default": 25,
+    "slider": {"min": 0, "max": 100, "step": 1}
+  },
+  "scratch_card_prize": {
+    "description": "刮刮乐中奖奖金",
+    "type": "string",
+    "hint": "中奖后返还到参与者余额的固定金额。",
+    "default": "0.30"
+  },
+  "scratch_card_cooldown_seconds": {
+    "description": "刮刮乐冷却秒数",
+    "type": "int",
+    "default": 60,
+    "slider": {"min": 0, "max": 86400, "step": 1}
+  },
   "transfer_max_amount": {
     "description": "单次转账上限",
     "type": "string",
